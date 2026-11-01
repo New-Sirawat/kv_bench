@@ -65,22 +65,23 @@ uv run python -m unittest discover tests -v
 ```
 
 ### Stage 3: Remote Cluster Profiling (KMUTT Slurm Cluster)
-All remote operations **strictly use** `./.agents/scripts/slurm_ctl.sh`. Never craft ad-hoc `ssh`/`scp` commands or run compute workloads on login node `ctl01`.
+All batch profiling executes on compute nodes in the `gpu4090` partition (never run compute on the login node `ctl01`).
 
-```bash
-# 1. Sync tracked source code to cluster ~/kv_bench/
-./.agents/scripts/slurm_ctl.sh sync
+1. **Sync Source Files:** Transfer tracked repository files (`src/`, `tests/`, `main.py`, `benchmark.sbatch`, `pyproject.toml`, `uv.lock`) to your cluster workspace `~/kv_bench/`.
+2. **Submit Batch Job:**
+   ```bash
+   sbatch benchmark.sbatch qwen3-4b
+   ```
+   *(Ensure `--max-vram-gb 16.0` is enforced on the RTX 4090).*
+3. **Monitor Execution:**
+   ```bash
+   squeue -u $USER
+   tail -f slurm-<job_id>.log
+   ```
+4. **Retrieve Results:** Fetch generated `results/*.json` and execution logs back to your local repository.
 
-# 2. Submit batch execution on gpu4090 partition
-./.agents/scripts/slurm_ctl.sh submit qwen3-4b
-
-# 3. Monitor execution status at safe intervals (e.g., every 15-30s)
-./.agents/scripts/slurm_ctl.sh status <job_id>
-./.agents/scripts/slurm_ctl.sh logs <job_id> 50
-
-# 4. Fetch telemetry and logs back to local workspace
-./.agents/scripts/slurm_ctl.sh fetch <job_id>
-```
+> [!NOTE]
+> *Personal Workstation Automation:* Developer workstations equipped with untracked helper scripts (e.g. `./.agents/scripts/slurm_ctl.sh`) may use them to automate `sync`, `submit`, `status`, and `fetch`, but standard `sbatch` / `squeue` commands remain the primary portable contract for all team members.
 
 ### Stage 4: Quality & Provenance Staging
 1. **Pillar 1 (Micro Logit Divergence):**
@@ -128,12 +129,13 @@ Earlier during the tracer bullet for `WP3-1` (StreamingLLM), work was split into
 
 ## 4. Cheat Sheet: Frequently Used Commands
 
-| Action | Command |
-| :--- | :--- |
-| **Dry-Run Technique** | `uv run main.py --technique <name> --model qwen3-4b --dry-run` |
-| **Run Unit Tests** | `uv run python -m unittest discover tests -v` |
-| **Sync Code to Cluster** | `./.agents/scripts/slurm_ctl.sh sync` |
-| **Submit Slurm Job** | `./.agents/scripts/slurm_ctl.sh submit qwen3-4b` |
-| **Check Job Status** | `./.agents/scripts/slurm_ctl.sh status <job_id>` |
-| **Fetch Cluster Results** | `./.agents/scripts/slurm_ctl.sh fetch <job_id>` |
-| **Cancel Slurm Job** | `./.agents/scripts/slurm_ctl.sh cancel <job_id>` |
+| Action | Standard Command (HPC Cluster) | Workstation Wrapper (If Configured) |
+| :--- | :--- | :--- |
+| **Dry-Run Technique** | `uv run main.py --technique <slug> --model qwen3-4b --dry-run` | — |
+| **Run Unit Tests** | `uv run python -m unittest discover tests -v` | — |
+| **Sync Code to Cluster** | `rsync -avz --exclude='.venv' . remote:~/kv_bench/` | `./.agents/scripts/slurm_ctl.sh sync` |
+| **Submit Slurm Job** | `sbatch benchmark.sbatch qwen3-4b` | `./.agents/scripts/slurm_ctl.sh submit qwen3-4b` |
+| **Check Job Status** | `squeue -u $USER` | `./.agents/scripts/slurm_ctl.sh status <job_id>` |
+| **View Job Logs** | `cat slurm-<job_id>.log` | `./.agents/scripts/slurm_ctl.sh logs <job_id> 50` |
+| **Fetch Results** | `scp remote:~/kv_bench/results/*.json results/` | `./.agents/scripts/slurm_ctl.sh fetch <job_id>` |
+| **Cancel Job** | `scancel <job_id>` | `./.agents/scripts/slurm_ctl.sh cancel <job_id>` |
