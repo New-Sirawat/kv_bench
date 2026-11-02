@@ -259,7 +259,11 @@ class ConcurrentChatWorkload(Workload):
         self.num_users = num_users
 
     def run(self, llm, context_length: int, max_tokens: int) -> WorkloadOutput:
-        from vllm import SamplingParams
+        try:
+            from vllm import SamplingParams
+            sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
+        except ImportError:
+            sampling_params = None
 
         tok = _get_tokenizer(llm)
         prefix = load_continuous_prefix(context_length, tokenizer=tok)
@@ -268,8 +272,6 @@ class ConcurrentChatWorkload(Workload):
             for i in range(self.num_users)
         ]
         prompts = [f"{prefix}\n\n{q}" for q in queries]
-
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
 
         start_wall = time.perf_counter()
         outputs = llm.generate(prompts, sampling_params)
