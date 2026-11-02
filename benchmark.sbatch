@@ -177,7 +177,6 @@ else
             --technique "$TECHNIQUE" \
             --model "$MODEL" \
             --workload longmem \
-            --dataset-path src/data/longmemeval_subset.json \
             --contexts $EVAL_CONTEXTS \
             --max-tokens 32 \
             --samples-per-task 10 \
