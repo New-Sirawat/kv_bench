@@ -1,0 +1,64 @@
+{
+  "manifest_version": "1.0",
+  "generated_at": "2026-11-02T12:12:00Z",
+  "provenance_type": "technique_run_manifest",
+  "milestone": "WP-3",
+  "work_package": "WP3-2",
+  "technique": "h2o",
+  "engine": "pytorch",
+  "axes": [
+    "STRUCTURAL"
+  ],
+  "technique_config": {
+    "cache_class": "H2OCache",
+    "heavy_hitter_tokens": 1024,
+    "recent_window_tokens": 1024,
+    "block_size": 16,
+    "effective_cache_tokens": 2048,
+    "effective_cache_blocks": 128
+  },
+  "primary_model": {
+    "name": "Qwen/Qwen3-4B-Instruct-2507",
+    "revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+    "architecture": "Pure Dense GQA",
+    "params": "4.02B",
+    "layers": 36,
+    "num_kv_heads": 8,
+    "num_q_heads": 32,
+    "head_dim": 128,
+    "dtype": "bfloat16"
+  },
+  "execution_environment": {
+    "cluster_node": "gpu01.slurm.cpe.kmutt.ac.th",
+    "slurm_job_id": "23958",
+    "gpu_model": "NVIDIA GeForce RTX 4090",
+    "physical_vram_gib": 23.52,
+    "process_allocator_cap_gib": 16.0,
+    "cap_fraction": 0.68,
+    "effective_gpu_utilization": 0.5783,
+    "cuda_version": "12.2",
+    "pytorch_version": "2.6.0"
+  },
+  "source_repository": {
+    "repo": "khemingkapat/kv_bench",
+    "branch": "feat/wp3-2-h2o",
+    "clean_working_tree": true
+  },
+  "golden_artifacts": {
+    "h2o_hardware_pytorch_16gb": {
+      "path": "results/runs/wp3/h2o_hardware_pytorch_16gb.json",
+      "sha256": "3b734e9c63ff986b83fb700af4201886896c85b41bd0a6ff241974903621b076",
+      "description": "Unified PyTorch context scaling sweep (512 to 32,768 tokens) with PyTorch profiling traces on 16GB cap"
+    },
+    "h2o_longmem_pytorch_16gb": {
+      "path": "results/runs/wp3/h2o_longmem_pytorch_16gb.json",
+      "sha256": "86086d7990cc5a0b668074339173503187ea5be8aa0852fed49b37f776d825b9",
+      "description": "Macro LongMemEval quality evaluation across contexts [512, 1024, 2048, 4096] under unified PyTorch runner"
+    },
+    "verify_h2o_pytorch_16gb": {
+      "path": "results/runs/wp3/verify_h2o_pytorch_16gb.json",
+      "sha256": "0547c50a940881e7e830557d0b18eb03b7f0df4fdb30540e2131b1e01d839a40",
+      "description": "Fast verification reference check (128 ctx, 16 tokens) capturing 100% Top-1 match against uncompressed reference"
+    }
+  }
+}
