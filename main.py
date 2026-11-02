@@ -84,6 +84,7 @@ def run_isolated_sweep(args, contexts: list[int], max_tokens: int, output_path: 
                 "--num-users", str(args.num_users),
                 "--output", tmp_out,
                 "--no-isolation",
+                "--engine", args.engine,
             ]
             if args.dry_run:
                 cmd.append("--dry-run")
@@ -199,6 +200,12 @@ Examples:
         type=int,
         default=10,
         help="Number of simulated concurrent users for --workload concurrent (default: 10)",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["vllm", "pytorch"],
+        default="vllm",
+        help="Inference engine backend: vllm (industry standard) or pytorch (scientific control)",
     )
     parser.add_argument(
         "--max-vram-gb",
@@ -328,14 +335,15 @@ Examples:
 
 
 
+    engine_suffix = f"_{args.engine}" if args.engine != "vllm" else ""
     if args.verify:
         contexts = [128]
         max_tokens = 16
-        default_output = f"results/verify_{args.technique}.json"
+        default_output = f"results/verify_{args.technique}{engine_suffix}.json"
     else:
         contexts = parse_contexts(args.contexts)
         max_tokens = args.max_tokens
-        default_output = f"results/{args.technique}.json"
+        default_output = f"results/{args.technique}{engine_suffix}.json"
 
     output_path = args.output or default_output
     output_dir = os.path.dirname(output_path)
@@ -363,6 +371,7 @@ Examples:
             max_vram_gb=args.max_vram_gb,
             save_reference=args.save_reference,
             eval_reference=args.eval_reference,
+            engine=args.engine,
         )
 
 

@@ -56,6 +56,7 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 # Default to primary pure dense model (qwen3-4b); accepts aliases (phi4-mini, qwen3.5-4b, etc.)
 MODEL="${1:-qwen3-4b}"
 TECHNIQUE="${TECHNIQUE:-streamingllm}"
+ENGINE="${ENGINE:-vllm}"
 RUN_FULL_SWEEP="${RUN_FULL_SWEEP:-1}"
 SKIP_HARDWARE_SWEEPS="${SKIP_HARDWARE_SWEEPS:-0}"
 CONTEXTS="512 1024 2048 4096 8192 16384 32768"
@@ -65,6 +66,32 @@ EVAL_CONTEXTS="512 1024 2048 4096"
 
 echo "Model Selected:     $MODEL"
 echo "Technique Selected: $TECHNIQUE"
+echo "Engine Selected:    $ENGINE"
+
+if [[ "$TECHNIQUE" == "baseline" && "$ENGINE" == "pytorch" ]]; then
+    echo ">> Running PyTorch Baseline Verification (128 ctx, 16 tokens, 16.0 GB VRAM cap)..."
+    uv run --no-sync main.py \
+        --technique baseline \
+        --engine pytorch \
+        --model "$MODEL" \
+        --verify \
+        --max-vram-gb 16.0 \
+        --save-reference results/references/verify_ref_pytorch.json \
+        --output results/verify_baseline_pytorch_16gb.json
+
+    if [[ "$RUN_FULL_SWEEP" == "1" ]]; then
+        echo ">> Running PyTorch Baseline Context Scaling Sweep (512 - 32768)..."
+        uv run --no-sync main.py \
+            --technique baseline \
+            --engine pytorch \
+            --model "$MODEL" \
+            --contexts $CONTEXTS \
+            --max-vram-gb 16.0 \
+            --output results/baseline_pytorch_16gb.json
+    fi
+    echo "=== PyTorch Baseline Benchmark Run Completed Successfully ==="
+    exit 0
+fi
 
 if [[ "$TECHNIQUE" == "baseline" ]]; then
     echo ">> 0. Running Fast Verification & Reference Capture (128 ctx, 16 tokens, 16.0 GB VRAM cap)..."
