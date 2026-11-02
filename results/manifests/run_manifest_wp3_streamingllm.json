@@ -54,11 +54,6 @@
       "path": "results/runs/wp3/streamingllm_longmem_16gb.json",
       "sha256": "a21e0a4326c1120fb82a48a49d264fc1040110041d09ba8531edd9bc9ede674f",
       "description": "Macro LongMemEval quality evaluation across contexts [512, 1024, 2048, 4096] calibrated against baseline reference"
-    },
-    "verify_streamingllm_16gb": {
-      "path": "results/verify_streamingllm_16gb.json",
-      "sha256": "009e9d256e677ad969b5143b248cf78cad1955ce1cedd6a3aab8d46c133bfe41",
-      "description": "Fast verification identity and memory check (128 ctx, 16 tokens) on 16GB cap"
     }
   }
 }
