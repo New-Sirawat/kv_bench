@@ -107,9 +107,6 @@ class LongMemEvalWorkload(Workload):
 
             prompts.append(f"{prefix}{ctx_text}\nUser: {s['question']}\nAssistant:")
 
-
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens, logprobs=5)
-
         start_wall = time.perf_counter()
         outputs = llm.generate(prompts, sampling_params)
         end_wall = time.perf_counter()

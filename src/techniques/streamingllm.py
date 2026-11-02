@@ -485,6 +485,14 @@ class StreamingLLMTechnique(Technique):
     def workload(self) -> Workload:
         return SyntheticFiller()
 
+    def pytorch_cache_factory(self) -> Any:
+        from src.techniques.streaming_cache import StreamingCache
+
+        return lambda: StreamingCache(
+            sink_tokens=self.sink_tokens,
+            window_size=self.window_size,
+        )
+
     def extra_metrics(self, llm, workload_output) -> dict[str, Any]:
         del llm
         total_seq_len = 0
