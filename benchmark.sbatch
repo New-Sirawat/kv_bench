@@ -55,8 +55,8 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 
 # Default to primary pure dense model (qwen3-4b); accepts aliases (phi4-mini, qwen3.5-4b, etc.)
 MODEL="${1:-qwen3-4b}"
-TECHNIQUE="${TECHNIQUE:-streamingllm}"
-ENGINE="${ENGINE:-vllm}"
+TECHNIQUE="${TECHNIQUE:-baseline}"
+ENGINE="${ENGINE:-pytorch}"
 RUN_FULL_SWEEP="${RUN_FULL_SWEEP:-1}"
 SKIP_HARDWARE_SWEEPS="${SKIP_HARDWARE_SWEEPS:-0}"
 CONTEXTS="512 1024 2048 4096 8192 16384 32768"
