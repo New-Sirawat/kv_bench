@@ -160,6 +160,8 @@ def run_benchmark(
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     # Avoid FlashInfer JIT sampling compilation against older system nvcc (e.g. CUDA 12.2)
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    # Enable PyTorch expandable segments to prevent allocator fragmentation across long multi-request sweeps
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     if not dry_run and engine == "vllm":
         from vllm import LLM  # noqa: F401 -- deferred so dry-run works without vllm

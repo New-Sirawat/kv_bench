@@ -113,7 +113,7 @@ class PyTorchRunner:
         sampling_params: Any = None,
         max_tokens: int = 64,
         logprobs_topk: int = 5,
-        chunk_size: int = 2048,
+        chunk_size: int = 1024,
     ) -> list[PyTorchRequestOutput]:
         """Execute autoregressive generation across requested prompts."""
         if isinstance(prompts, str):
@@ -295,5 +295,14 @@ class PyTorchRunner:
                 metrics=metrics,
             )
             request_outputs.append(req_out)
+
+            # Explicit cleanup of per-request GPU tensors to prevent allocator fragmentation
+            del input_ids, cache, out, next_token, last_logits
+            if "step_out" in locals():
+                del step_out
+            if "pos_tensor" in locals():
+                del pos_tensor
+            if use_cuda:
+                torch.cuda.empty_cache()
 
         return request_outputs
