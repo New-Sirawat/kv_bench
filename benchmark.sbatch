@@ -52,6 +52,7 @@ echo "========================================="
 # allocator and vLLM's KV allocation pool) so results strictly mirror 16GB VRAM.
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VLLM_USE_FLASHINFER_SAMPLER=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Default to primary pure dense model (qwen3-4b); accepts aliases (phi4-mini, qwen3.5-4b, etc.)
 MODEL="${1:-qwen3-4b}"
