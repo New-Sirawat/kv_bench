@@ -209,6 +209,78 @@ class TestH2OTechnique(unittest.TestCase):
 
         _ACTIVE_H2O_CONFIG["enabled"] = False
 
+    def test_pytorch_cache_factory_and_h2o_cache_lifecycle(self):
+        from src.techniques.h2o_cache import H2OCache, H2OLayer, record_h2o_attention_scores
+
+        technique = get_technique("h2o", heavy_hitter_tokens=16, recent_window_tokens=16)
+        factory = technique.pytorch_cache_factory()
+        self.assertIsNotNone(factory)
+
+        cache = factory()
+        self.assertIsInstance(cache, H2OCache)
+        self.assertEqual(cache.get_max_length(), 32)
+        self.assertEqual(cache.heavy_hitter_tokens, 16)
+        self.assertEqual(cache.recent_window_tokens, 16)
+
+        # Feed initial prompt of 32 tokens
+        batch, num_kv_heads, num_q_heads, head_dim = 1, 4, 16, 64
+        layer = H2OLayer(heavy_hitter_tokens=16, recent_window_tokens=16)
+
+        k1 = torch.randn(batch, num_kv_heads, 32, head_dim, dtype=torch.bfloat16)
+        v1 = torch.randn(batch, num_kv_heads, 32, head_dim, dtype=torch.bfloat16)
+        k_out, v_out = layer.update(k1, v1)
+        self.assertEqual(k_out.shape, (batch, num_kv_heads, 32, head_dim))
+        self.assertEqual(layer.cumulative_scores.shape, (batch, num_kv_heads, 32))
+        self.assertTrue((layer.cumulative_scores == 0.0).all())
+
+        # Give tokens 2 and 5 high synthetic attention
+        step_scores = torch.zeros(batch, num_kv_heads, 32)
+        step_scores[:, :, 2] = 100.0
+        step_scores[:, :, 5] = 100.0
+        layer.record_scores(step_scores)
+        self.assertEqual(layer.cumulative_scores[:, :, 2].mean().item(), 100.0)
+
+        # Append 1 new token during decode (seq_len becomes 33 > capacity 32)
+        k2 = torch.randn(batch, num_kv_heads, 1, head_dim, dtype=torch.bfloat16)
+        v2 = torch.randn(batch, num_kv_heads, 1, head_dim, dtype=torch.bfloat16)
+        layer.update(k2, v2)
+        self.assertEqual(layer.get_seq_length(), 33)
+
+        # Run decode attention scoring
+        q_dec = torch.randn(batch, num_q_heads, 1, head_dim, dtype=torch.bfloat16)
+        record_h2o_attention_scores(layer, q_dec, layer.keys)
+        self.assertEqual(layer.cumulative_scores.shape, (batch, num_kv_heads, 33))
+
+        # Prune: must evict 1 middle token while retaining token 2, 5, and the recent 16 tokens [17..32]
+        layer.prune()
+        self.assertEqual(layer.get_seq_length(), 32)
+        self.assertEqual(layer.keys.shape, (batch, num_kv_heads, 32, head_dim))
+        self.assertEqual(layer.values.shape, (batch, num_kv_heads, 32, head_dim))
+        self.assertEqual(layer.cumulative_scores.shape, (batch, num_kv_heads, 32))
+
+    def test_h2o_cache_prune_after_chunk(self):
+        from src.techniques.h2o_cache import H2OCache
+
+        cache = H2OCache(heavy_hitter_tokens=16, recent_window_tokens=16)
+        batch, num_kv_heads, head_dim = 1, 4, 64
+
+        # Chunk 1: 32 tokens (fills capacity)
+        k_chunk1 = torch.randn(batch, num_kv_heads, 32, head_dim, dtype=torch.bfloat16)
+        v_chunk1 = torch.randn(batch, num_kv_heads, 32, head_dim, dtype=torch.bfloat16)
+        cache.update(k_chunk1, v_chunk1, layer_idx=0)
+        cache.prune_after_chunk()
+        self.assertEqual(cache.get_seq_length(0), 32)
+
+        # Chunk 2: 16 more tokens (now 48 tokens > 32)
+        k_chunk2 = torch.randn(batch, num_kv_heads, 16, head_dim, dtype=torch.bfloat16)
+        v_chunk2 = torch.randn(batch, num_kv_heads, 16, head_dim, dtype=torch.bfloat16)
+        cache.update(k_chunk2, v_chunk2, layer_idx=0)
+        self.assertEqual(cache.get_seq_length(0), 48)
+
+        # prune_after_chunk must clamp cache back to 32 tokens
+        cache.prune_after_chunk()
+        self.assertEqual(cache.get_seq_length(0), 32)
+
 
 if __name__ == "__main__":
     unittest.main()

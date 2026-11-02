@@ -418,6 +418,44 @@ def _install_vllm_h2o_hooks() -> None:
     _HOOKS_INSTALLED = True
 
 
+_PYTORCH_HOOKS_INSTALLED: bool = False
+
+
+def _install_pytorch_h2o_hooks() -> None:
+    """Install attention wrapper into transformers ALL_ATTENTION_FUNCTIONS for H2O."""
+    global _PYTORCH_HOOKS_INSTALLED
+    if _PYTORCH_HOOKS_INSTALLED:
+        return
+
+    try:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        from src.techniques.h2o_cache import get_active_h2o_cache, record_h2o_attention_scores
+    except ImportError:
+        return
+
+    orig_sdpa = ALL_ATTENTION_FUNCTIONS.get_interface("sdpa", None)
+    if orig_sdpa is None:
+        return
+
+    def h2o_sdpa_attention_forward(module, query, key, value, *args, **kwargs):
+        output, attn_weights = orig_sdpa(module, query, key, value, *args, **kwargs)
+
+        cache = get_active_h2o_cache()
+        if cache is not None and getattr(cache, "is_h2o", False):
+            layer_idx = getattr(module, "layer_idx", None)
+            if layer_idx is not None and layer_idx < len(cache.layers):
+                layer = cache.layers[layer_idx]
+                record_h2o_attention_scores(layer, query, key)
+                # In decode step (single token query), prune immediately if over capacity
+                if query.shape[-2] == 1:
+                    layer.prune()
+
+        return output, attn_weights
+
+    ALL_ATTENTION_FUNCTIONS.register("sdpa", h2o_sdpa_attention_forward)
+    _PYTORCH_HOOKS_INSTALLED = True
+
+
 @register("h2o")
 class H2OTechnique(Technique):
     """H2O: Heavy-Hitter Oracle KV-cache eviction.
@@ -499,7 +537,7 @@ class H2OTechnique(Technique):
         )
 
     def setup(self) -> None:
-        """Configure active H2O state and install process-level vLLM hooks."""
+        """Configure active H2O state and install process-level vLLM and PyTorch hooks."""
         _ACTIVE_H2O_CONFIG.update(
             {
                 "enabled": True,
@@ -512,6 +550,7 @@ class H2OTechnique(Technique):
             }
         )
         _install_vllm_h2o_hooks()
+        _install_pytorch_h2o_hooks()
 
     def engine_kwargs(self, context_length: int, max_tokens: int) -> dict[str, Any]:
         """Return valid vllm.EngineArgs kwargs configuring block size and sliding window."""
@@ -528,6 +567,14 @@ class H2OTechnique(Technique):
 
     def workload(self) -> Workload:
         return SyntheticFiller()
+
+    def pytorch_cache_factory(self) -> Any:
+        from src.techniques.h2o_cache import H2OCache
+
+        return lambda: H2OCache(
+            heavy_hitter_tokens=self.heavy_hitter_tokens,
+            recent_window_tokens=self.recent_window_tokens,
+        )
 
     def extra_metrics(self, llm, workload_output) -> dict[str, Any]:
         del llm
