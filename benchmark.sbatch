@@ -55,97 +55,136 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 
 # Default to primary pure dense model (qwen3-4b); accepts aliases (phi4-mini, qwen3.5-4b, etc.)
 MODEL="${1:-qwen3-4b}"
+TECHNIQUE="${TECHNIQUE:-streamingllm}"
 RUN_FULL_SWEEP="${RUN_FULL_SWEEP:-1}"
 SKIP_HARDWARE_SWEEPS="${SKIP_HARDWARE_SWEEPS:-0}"
-CONTEXTS="512 1024 2048 4096 8192 16384 32768 49152 65536"
+CONTEXTS="512 1024 2048 4096 8192 16384 32768"
 CONCURRENT_CONTEXTS="1024 2048 4096 8192"
 CONCURRENT_USERS="1 4 8 12 16"
 EVAL_CONTEXTS="512 1024 2048 4096"
 
-echo "Model Selected: $MODEL"
+echo "Model Selected:     $MODEL"
+echo "Technique Selected: $TECHNIQUE"
 
-echo ">> 0. Running Fast Verification & Reference Capture (128 ctx, 16 tokens, 16.0 GB VRAM cap)..."
-uv run --no-sync main.py \
-    --technique baseline \
-    --model "$MODEL" \
-    --verify \
-    --max-vram-gb 16.0 \
-    --save-reference results/references/verify_ref.json \
-    --output results/verify_16gb.json
+if [[ "$TECHNIQUE" == "baseline" ]]; then
+    echo ">> 0. Running Fast Verification & Reference Capture (128 ctx, 16 tokens, 16.0 GB VRAM cap)..."
+    uv run --no-sync main.py \
+        --technique baseline \
+        --model "$MODEL" \
+        --verify \
+        --max-vram-gb 16.0 \
+        --save-reference results/references/verify_ref.json \
+        --output results/verify_16gb.json
 
-echo ">> 0a. Running Identity Quality Check (evaluating against reference, 128 ctx)..."
-uv run --no-sync main.py \
-    --technique baseline \
-    --model "$MODEL" \
-    --verify \
-    --max-vram-gb 16.0 \
-    --eval-reference results/references/verify_ref.json \
-    --output results/verify_identity_16gb.json
+    echo ">> 0a. Running Identity Quality Check (evaluating against reference, 128 ctx)..."
+    uv run --no-sync main.py \
+        --technique baseline \
+        --model "$MODEL" \
+        --verify \
+        --max-vram-gb 16.0 \
+        --eval-reference results/references/verify_ref.json \
+        --output results/verify_identity_16gb.json
 
-echo ">> 0b. Running Balanced LongMemEval Sanity Check (1 sample per task, seed 42, 512 ctx)..."
-uv run --no-sync main.py \
-    --technique baseline \
-    --model "$MODEL" \
-    --workload longmem \
-    --dataset-path src/data/longmemeval_subset.json \
-    --contexts 512 \
-    --max-tokens 32 \
-    --samples-per-task 1 \
-    --seed 42 \
-    --max-vram-gb 16.0 \
-    --output results/sanity_longmem_16gb.json
-
-echo ">> 0c. Running Cross-Model Divergence Calibration (evaluating qwen3-1.7b against qwen3-4b reference)..."
-uv run --no-sync main.py \
-    --technique baseline \
-    --model qwen3-1.7b \
-    --verify \
-    --max-vram-gb 16.0 \
-    --eval-reference results/references/verify_ref.json \
-    --output results/verify_cross_model_16gb.json
-
-if [[ "$RUN_FULL_SWEEP" == "1" ]]; then
-    if [[ "$SKIP_HARDWARE_SWEEPS" != "1" ]]; then
-        echo ">> 1. Running Baseline Single-Stream Scaling Sweep (512 - 65536)..."
-        uv run --no-sync main.py \
-            --technique baseline \
-            --model "$MODEL" \
-            --contexts $CONTEXTS \
-            --max-vram-gb 16.0 \
-            --output results/baseline_hardware_16gb.json
-        cp results/baseline_hardware_16gb.json results/baseline_16gb.json
-
-        echo ">> 2. Running Baseline Multi-User Concurrency Grid (1, 4, 8, 12, 16 users across 1024-8192 ctx)..."
-        for U in $CONCURRENT_USERS; do
-            echo "   -> Running concurrency sweep for $U concurrent user(s)..."
-            uv run --no-sync main.py \
-                --technique baseline \
-                --model "$MODEL" \
-                --workload concurrent \
-                --num-users "$U" \
-                --contexts $CONCURRENT_CONTEXTS \
-                --max-vram-gb 16.0 \
-                --output "results/concurrent_${U}users_16gb.json"
-        done
-        uv run --no-sync python scripts/consolidate_concurrency_results.py \
-            --inputs results/concurrent_*users_16gb.json \
-            --output results/concurrent_baseline_16gb.json
-    else
-        echo ">> Skipping Steps 1 & 2 (Hardware sweeps already verified and consolidated)."
-    fi
-
-    echo ">> 3. Running Baseline Long-Term Memory Adherence & Reference Capture (LongMemEval across contexts)..."
+    echo ">> 0b. Running Balanced LongMemEval Sanity Check (1 sample per task, seed 42, 512 ctx)..."
     uv run --no-sync main.py \
         --technique baseline \
         --model "$MODEL" \
         --workload longmem \
-        --contexts $EVAL_CONTEXTS \
+        --dataset-path src/data/longmemeval_subset.json \
+        --contexts 512 \
         --max-tokens 32 \
-        --samples-per-task 10 \
+        --samples-per-task 1 \
         --seed 42 \
         --max-vram-gb 16.0 \
-        --save-reference "results/references/baseline_${MODEL}_ref.json" \
-        --output results/longmem_baseline_16gb.json
+        --output results/sanity_longmem_16gb.json
+
+    echo ">> 0c. Running Cross-Model Divergence Calibration (evaluating qwen3-1.7b against qwen3-4b reference)..."
+    uv run --no-sync main.py \
+        --technique baseline \
+        --model qwen3-1.7b \
+        --verify \
+        --max-vram-gb 16.0 \
+        --eval-reference results/references/verify_ref.json \
+        --output results/verify_cross_model_16gb.json
+
+    if [[ "$RUN_FULL_SWEEP" == "1" ]]; then
+        if [[ "$SKIP_HARDWARE_SWEEPS" != "1" ]]; then
+            echo ">> 1. Running Baseline Single-Stream Scaling Sweep (512 - 65536)..."
+            uv run --no-sync main.py \
+                --technique baseline \
+                --model "$MODEL" \
+                --contexts 512 1024 2048 4096 8192 16384 32768 49152 65536 \
+                --max-vram-gb 16.0 \
+                --output results/baseline_hardware_16gb.json
+            cp results/baseline_hardware_16gb.json results/baseline_16gb.json
+
+            echo ">> 2. Running Baseline Multi-User Concurrency Grid (1, 4, 8, 12, 16 users across 1024-8192 ctx)..."
+            for U in $CONCURRENT_USERS; do
+                echo "   -> Running concurrency sweep for $U concurrent user(s)..."
+                uv run --no-sync main.py \
+                    --technique baseline \
+                    --model "$MODEL" \
+                    --workload concurrent \
+                    --num-users "$U" \
+                    --contexts $CONCURRENT_CONTEXTS \
+                    --max-vram-gb 16.0 \
+                    --output "results/concurrent_${U}users_16gb.json"
+            done
+            uv run --no-sync python scripts/consolidate_concurrency_results.py \
+                --inputs results/concurrent_*users_16gb.json \
+                --output results/concurrent_baseline_16gb.json
+        else
+            echo ">> Skipping Steps 1 & 2 (Hardware sweeps already verified and consolidated)."
+        fi
+
+        echo ">> 3. Running Baseline Long-Term Memory Adherence & Reference Capture (LongMemEval across contexts)..."
+        uv run --no-sync main.py \
+            --technique baseline \
+            --model "$MODEL" \
+            --workload longmem \
+            --contexts $EVAL_CONTEXTS \
+            --max-tokens 32 \
+            --samples-per-task 10 \
+            --seed 42 \
+            --max-vram-gb 16.0 \
+            --save-reference "results/references/baseline_${MODEL}_ref.json" \
+            --output results/longmem_baseline_16gb.json
+    fi
+else
+    echo ">> 0. Running Technique Verification (${TECHNIQUE}, 128 ctx, 16 tokens)..."
+    uv run --no-sync main.py \
+        --technique "$TECHNIQUE" \
+        --model "$MODEL" \
+        --verify \
+        --max-vram-gb 16.0 \
+        --eval-reference results/references/verify_ref.json \
+        --output "results/verify_${TECHNIQUE}_16gb.json"
+
+    if [[ "$RUN_FULL_SWEEP" == "1" ]]; then
+        if [[ "$SKIP_HARDWARE_SWEEPS" != "1" ]]; then
+            echo ">> 1. Running Technique Single-Stream Scaling Sweep (${TECHNIQUE}, 512 - 32768, with profiling)..."
+            uv run --no-sync main.py \
+                --technique "$TECHNIQUE" \
+                --model "$MODEL" \
+                --contexts $CONTEXTS \
+                --max-vram-gb 16.0 \
+                --profile \
+                --output "results/${TECHNIQUE}_hardware_16gb.json"
+        fi
+
+        echo ">> 2. Running Macro LongMemEval Adherence & Quality Evaluation (${TECHNIQUE} vs baseline reference)..."
+        uv run --no-sync main.py \
+            --technique "$TECHNIQUE" \
+            --model "$MODEL" \
+            --workload longmem \
+            --contexts $EVAL_CONTEXTS \
+            --max-tokens 32 \
+            --samples-per-task 10 \
+            --seed 42 \
+            --max-vram-gb 16.0 \
+            --eval-reference "results/references/baseline_${MODEL}_ref.json" \
+            --output "results/${TECHNIQUE}_longmem_16gb.json"
+    fi
 fi
 
 echo "========================================="

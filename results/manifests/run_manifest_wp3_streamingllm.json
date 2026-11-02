@@ -1,0 +1,59 @@
+{
+  "manifest_version": "1.0",
+  "generated_at": "2026-11-02T11:18:00Z",
+  "provenance_type": "technique_run_manifest",
+  "milestone": "WP-3",
+  "work_package": "WP3-1",
+  "technique": "streamingllm",
+  "axes": [
+    "STRUCTURAL"
+  ],
+  "technique_config": {
+    "sink_tokens": 4,
+    "window_size": 2048,
+    "block_size": 16,
+    "effective_cache_tokens": 2052,
+    "effective_sliding_window": 2064
+  },
+  "primary_model": {
+    "name": "Qwen/Qwen3-4B-Instruct-2507",
+    "revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+    "architecture": "Pure Dense GQA",
+    "params": "4.02B",
+    "layers": 36,
+    "num_kv_heads": 8,
+    "num_q_heads": 32,
+    "head_dim": 128,
+    "dtype": "bfloat16"
+  },
+  "execution_environment": {
+    "cluster_node": "gpu01.slurm.cpe.kmutt.ac.th",
+    "slurm_job_id": "23910",
+    "gpu_model": "NVIDIA GeForce RTX 4090",
+    "physical_vram_gib": 23.52,
+    "process_allocator_cap_gib": 16.0,
+    "cap_fraction": 0.68,
+    "effective_gpu_utilization": 0.5783,
+    "cuda_version": "13.0",
+    "nvidia_driver": "580.178.04",
+    "vllm_version": "0.30.0",
+    "pytorch_version": "2.13.0+cu130"
+  },
+  "source_repository": {
+    "repo": "khemingkapat/kv_bench",
+    "commit_sha": "1241f5581335ad43ca7c4aa029f6350364860b73",
+    "clean_working_tree": true
+  },
+  "golden_artifacts": {
+    "streamingllm_hardware_16gb": {
+      "path": "results/runs/wp3/streamingllm_hardware_16gb.json",
+      "sha256": "1548642be29116bc742cd40d5c2605b56235f7d33169c984b939df07ceb328fb",
+      "description": "Single-stream context scaling sweep (512 to 32,768 tokens) with PyTorch profiling traces on 16GB cap"
+    },
+    "streamingllm_longmem_16gb": {
+      "path": "results/runs/wp3/streamingllm_longmem_16gb.json",
+      "sha256": "a21e0a4326c1120fb82a48a49d264fc1040110041d09ba8531edd9bc9ede674f",
+      "description": "Macro LongMemEval quality evaluation across contexts [512, 1024, 2048, 4096] calibrated against baseline reference"
+    }
+  }
+}
