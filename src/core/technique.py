@@ -41,6 +41,12 @@ class Technique(ABC):
         core.workload.ColdWarm."""
         return SyntheticFiller()
 
+    def pytorch_cache_factory(self) -> Any:
+        """Optional factory returning a transformers.cache_utils.Cache instance for PyTorch runner.
+        Defaults to None (which causes PyTorchRunner to instantiate DynamicCache).
+        """
+        return None
+
     def extra_metrics(self, llm, workload_output: WorkloadOutput) -> dict[str, Any]:
         """Optional technique-specific metrics layered on top of the core
         schema, e.g. PCIe bytes transferred or a quality score."""

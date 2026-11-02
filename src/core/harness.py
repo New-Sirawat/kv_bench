@@ -133,6 +133,7 @@ def run_benchmark(
     max_vram_gb: float | None = 16.0,
     save_reference: str | None = None,
     eval_reference: str | None = None,
+    engine: str = "vllm",
 ) -> RunResult:
 
     """Run a technique across all requested context lengths.
@@ -160,7 +161,7 @@ def run_benchmark(
     # Avoid FlashInfer JIT sampling compilation against older system nvcc (e.g. CUDA 12.2)
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
-    if not dry_run:
+    if not dry_run and engine == "vllm":
         from vllm import LLM  # noqa: F401 -- deferred so dry-run works without vllm
 
     technique.setup()
@@ -183,7 +184,7 @@ def run_benchmark(
     target_model, model_revision, model_extra_args = resolve_model_target(model)
     extra_model_kwargs = _parse_extra_vllm_args(model_extra_args)
 
-    print(f"=== {technique.name} :: axes={axes} ===")
+    print(f"=== {technique.name} [engine: {engine}] :: axes={axes} ===")
     rev_str = f" (revision: {model_revision[:8]})" if model_revision else ""
     print(f"Model: {target_model}{rev_str} | GPU: {gpu_name}" + (" [DRY RUN]" if dry_run else ""))
     print("-" * 65)
@@ -207,26 +208,38 @@ def run_benchmark(
                     requested_ctx=ctx,
                     status="DRY_RUN",
                     axes=axes,
-                    extra={"max_vram_gb": max_vram_gb} if max_vram_gb is not None else {},
+                    extra={
+                        "max_vram_gb": max_vram_gb,
+                        "engine": engine,
+                    } if max_vram_gb is not None else {"engine": engine},
                 )
-                print(f" -> DRY RUN OK (engine kwargs: {engine_kwargs})")
+                print(f" -> DRY RUN OK (engine: {engine}, kwargs: {engine_kwargs})")
                 entries.append(entry)
                 continue
 
-            from vllm import LLM
-
-            dtype_choice = "bfloat16" if (torch is not None and torch.cuda.is_bf16_supported()) else "half"
-
-            llm = LLM(
-                model=target_model,
-                dtype=dtype_choice,
-                gpu_memory_utilization=effective_utilization,
-                max_model_len=engine_kwargs.pop("max_model_len", max(2048, ctx + max_tokens + 2048)),
-                trust_remote_code=True,
-                enforce_eager=True,
-                disable_log_stats=False,
-                **engine_kwargs,
-            )
+            if engine == "pytorch":
+                from .pytorch_runner import PyTorchRunner
+                cache_factory = technique.pytorch_cache_factory()
+                llm = PyTorchRunner(
+                    model_name_or_path=target_model,
+                    revision=model_revision,
+                    cache_factory=cache_factory,
+                    trust_remote_code=True,
+                    dry_run=dry_run,
+                )
+            else:
+                from vllm import LLM
+                dtype_choice = "bfloat16" if (torch is not None and torch.cuda.is_bf16_supported()) else "half"
+                llm = LLM(
+                    model=target_model,
+                    dtype=dtype_choice,
+                    gpu_memory_utilization=effective_utilization,
+                    max_model_len=engine_kwargs.pop("max_model_len", max(2048, ctx + max_tokens + 2048)),
+                    trust_remote_code=True,
+                    enforce_eager=True,
+                    disable_log_stats=False,
+                    **engine_kwargs,
+                )
 
             if profile:
                 trace_path = _run_with_profiler(llm, workload, ctx, max_tokens, profile_dir, technique.name)
@@ -240,6 +253,9 @@ def run_benchmark(
             tp = throughput(output.generated_tokens, output.decode_time_sec, output.total_time_sec)
 
             extra = technique.extra_metrics(llm, output)
+            extra["engine"] = engine
+            if engine == "pytorch":
+                extra["attn_implementation"] = "sdpa"
             if max_vram_gb is not None:
                 extra["max_vram_gb"] = max_vram_gb
                 extra["effective_gpu_utilization"] = effective_utilization
