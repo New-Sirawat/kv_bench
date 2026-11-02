@@ -78,7 +78,11 @@ class LongMemEvalWorkload(Workload):
 
 
     def run(self, llm, context_length: int, max_tokens: int) -> WorkloadOutput:
-        from vllm import SamplingParams
+        try:
+            from vllm import SamplingParams
+            sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens, logprobs=5)
+        except ImportError:
+            sampling_params = None
 
         from src.core.workload import _get_tokenizer, load_continuous_prefix
 
@@ -102,9 +106,6 @@ class LongMemEvalWorkload(Workload):
                 ) if remaining > 20 else ""
 
             prompts.append(f"{prefix}{ctx_text}\nUser: {s['question']}\nAssistant:")
-
-
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens, logprobs=5)
 
         start_wall = time.perf_counter()
         outputs = llm.generate(prompts, sampling_params)
