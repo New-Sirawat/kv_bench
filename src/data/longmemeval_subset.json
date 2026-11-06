@@ -5,7 +5,10 @@
     "context": "User: I just moved to Seattle last week and started my new job at Contoso.\nAssistant: Congratulations on the move to Seattle and the new role at Contoso!\nUser: Thanks, my manager's name is Marcus Vance and our primary focus is distributed storage.\nAssistant: Noted. Marcus Vance will be leading your work on distributed storage.",
     "question": "What is the name of my manager?",
     "expected_answer": "Marcus Vance",
-    "unanswerable": false
+    "unanswerable": false,
+    "word_count": 55,
+    "approx_tokens": 74,
+    "length_tier": "short"
   },
   {
     "id": "fr_02",
@@ -13,7 +16,10 @@
     "context": "User: For the GPU evaluation, our primary benchmark system uses an RTX 4060 with 8GB VRAM.\nAssistant: Got it, RTX 4060 with 8GB VRAM is the primary testbed.\nUser: And our host machine has 16GB of DDR5 RAM connected over PCIe Gen 4.\nAssistant: Recorded 16GB DDR5 RAM with PCIe Gen 4 interface.",
     "question": "Which GPU model and how much VRAM are we using for the primary testbed?",
     "expected_answer": "RTX 4060",
-    "unanswerable": false
+    "unanswerable": false,
+    "word_count": 53,
+    "approx_tokens": 71,
+    "length_tier": "short"
   },
   {
     "id": "cs_01",
@@ -21,7 +27,10 @@
     "context": "User: In our last session, Alice mentioned that project Alpha requires 12 GB VRAM.\nAssistant: Understood, project Alpha requires 12 GB VRAM.\nUser: In today's meeting, Bob stated that our workstation has 8 GB VRAM available.\nAssistant: Understood, 8 GB VRAM is available on the workstation.",
     "question": "Can project Alpha run completely within the workstation VRAM without offloading or compression?",
     "expected_answer": "No",
-    "unanswerable": false
+    "unanswerable": false,
+    "word_count": 46,
+    "approx_tokens": 62,
+    "length_tier": "short"
   },
   {
     "id": "cs_02",
@@ -29,7 +38,10 @@
     "context": "User: Session 1: Team Red submitted their final code on Monday at 3 PM.\nAssistant: Noted for Team Red.\nUser: Session 2: Team Blue submitted their code 24 hours after Team Red.\nAssistant: Noted for Team Blue.",
     "question": "On what day and time did Team Blue submit their code?",
     "expected_answer": "Tuesday",
-    "unanswerable": false
+    "unanswerable": false,
+    "word_count": 37,
+    "approx_tokens": 49,
+    "length_tier": "short"
   },
   {
     "id": "iu_01",
@@ -37,7 +49,10 @@
     "context": "User: My favorite programming language has always been Python.\nAssistant: Python is a great versatile language.\nUser: Actually, starting today, I've switched completely to Rust and consider it my new favorite.\nAssistant: Updated! Your favorite programming language is now Rust.",
     "question": "What is my current favorite programming language?",
     "expected_answer": "Rust",
-    "unanswerable": false
+    "unanswerable": false,
+    "word_count": 40,
+    "approx_tokens": 54,
+    "length_tier": "short"
   },
   {
     "id": "iu_02",
@@ -45,7 +60,10 @@
     "context": "User: The project deadline was initially scheduled for November 15.\nAssistant: Marked November 15 as the deadline.\nUser: Please update: our sponsor extended the deadline to December 1.\nAssistant: The deadline has been rescheduled to December 1.",
     "question": "What is the updated project deadline?",
     "expected_answer": "December 1",
-    "unanswerable": false
+    "unanswerable": false,
+    "word_count": 37,
+    "approx_tokens": 49,
+    "length_tier": "short"
   },
   {
     "id": "rt_01",
@@ -53,7 +71,10 @@
     "context": "User: Today is Wednesday, October 5th. Two days ago, we ran the initial profiling benchmark on vLLM.\nAssistant: So the initial profiling run occurred on Monday, October 3rd.\nUser: Exactly, and three days from today we will present the mid-term demo.\nAssistant: That will be on Saturday, October 8th.",
     "question": "On what day did we run the initial profiling benchmark?",
     "expected_answer": "October 3",
-    "unanswerable": false
+    "unanswerable": false,
+    "word_count": 49,
+    "approx_tokens": 66,
+    "length_tier": "short"
   },
   {
     "id": "rt_02",
@@ -61,7 +82,10 @@
     "context": "User: The team started the sprint last Friday. The review meeting is scheduled for one week after start.\nAssistant: So the review meeting will be next Friday.\nUser: Correct, and the retrospective is the day after the review.\nAssistant: Understood, retrospective on Saturday.",
     "question": "What day of the week is the retrospective?",
     "expected_answer": "Saturday",
-    "unanswerable": false
+    "unanswerable": false,
+    "word_count": 43,
+    "approx_tokens": 58,
+    "length_tier": "short"
   },
   {
     "id": "ur_01",
@@ -69,7 +93,10 @@
     "context": "User: We discussed the GPU memory hierarchy, including VRAM, system DRAM, and PCIe transfers.\nAssistant: Yes, covering the three tiers of memory.\nUser: We also analyzed H2O, FlexGen, and InfiniGen offloading mechanisms.\nAssistant: A comprehensive set of baseline methods.",
     "question": "What is the secret Wi-Fi password for our lab?",
     "expected_answer": "I don't know",
-    "unanswerable": true
+    "unanswerable": true,
+    "word_count": 39,
+    "approx_tokens": 52,
+    "length_tier": "short"
   },
   {
     "id": "ur_02",
@@ -77,6 +104,9 @@
     "context": "User: In our codebase we have baseline, flexgen_style, and lmcache techniques registered.\nAssistant: Those three techniques are currently in the registry.\nUser: All techniques adhere to the three-axis co-optimization model.\nAssistant: Correct.",
     "question": "Who was the Roman emperor in 45 BC?",
     "expected_answer": "not mentioned",
-    "unanswerable": true
+    "unanswerable": true,
+    "word_count": 32,
+    "approx_tokens": 43,
+    "length_tier": "short"
   }
 ]

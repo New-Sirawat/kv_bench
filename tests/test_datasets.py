@@ -76,6 +76,10 @@ class TestDatasetStagingAndManifest(unittest.TestCase):
             self.assertIn("context", record)
             self.assertIn("question", record)
             self.assertIn("expected_answer", record)
+            self.assertIn("word_count", record)
+            self.assertIn("approx_tokens", record)
+            self.assertIn("length_tier", record)
+            self.assertIn(record["length_tier"], {"short", "medium", "long"})
             self.assertIsInstance(record["unanswerable"], bool)
             self.assertTrue(len(record["context"]) > 0)
             self.assertTrue(len(record["question"]) > 0)
@@ -135,6 +139,29 @@ class TestDatasetStagingAndManifest(unittest.TestCase):
         self.assertIn("task_type", first_sample)
         self.assertIn("question", first_sample)
         self.assertIn("expected_answer", first_sample)
+        self.assertIn("length_tier", first_sample)
+
+    def test_workload_length_tier_filtering_and_selection(self):
+        # Test explicit length_tier filtering
+        short_wl = LongMemEvalWorkload(length_tier="short")
+        self.assertTrue(all(s.get("length_tier") == "short" for s in short_wl.samples))
+
+        medium_wl = LongMemEvalWorkload(length_tier="medium")
+        self.assertTrue(all(s.get("length_tier") == "medium" for s in medium_wl.samples))
+
+        long_wl = LongMemEvalWorkload(length_tier="long")
+        self.assertTrue(all(s.get("length_tier") == "long" for s in long_wl.samples))
+
+        # Test dynamic select_by_length
+        auto_wl = LongMemEvalWorkload(select_by_length=True)
+        samples_512 = auto_wl.get_active_samples(context_length=512)
+        self.assertTrue(all(s.get("approx_tokens", 0) <= 1200 for s in samples_512))
+
+        samples_2048 = auto_wl.get_active_samples(context_length=2048)
+        self.assertTrue(all(s.get("approx_tokens", 0) <= 2500 for s in samples_2048))
+
+        samples_16k = auto_wl.get_active_samples(context_length=16384)
+        self.assertTrue(all(s.get("approx_tokens", 0) >= 7000 for s in samples_16k))
 
     def test_load_continuous_prefix_from_pg19(self):
         pg19_dir = os.path.join(self.data_dir, "pg19")
