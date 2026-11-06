@@ -281,6 +281,44 @@ class TestH2OTechnique(unittest.TestCase):
         cache.prune_after_chunk()
         self.assertEqual(cache.get_seq_length(0), 32)
 
+    def test_h2o_cache_diagnostic_inspection(self):
+        from src.core.diagnostic import inspect_sample_diagnostic
+        from src.techniques.h2o_cache import H2OCache
+
+        # Capacity: 10 heavy hitters + 10 recent tokens = 20 tokens
+        cache = H2OCache(heavy_hitter_tokens=10, recent_window_tokens=10)
+        batch, num_kv_heads, head_dim = 1, 4, 64
+
+        # Feed 40 tokens across 2 sessions (20 tokens in S0, 20 tokens in S1)
+        k_chunk = torch.randn(batch, num_kv_heads, 40, head_dim, dtype=torch.bfloat16)
+        v_chunk = torch.randn(batch, num_kv_heads, 40, head_dim, dtype=torch.bfloat16)
+        cache.update(k_chunk, v_chunk, layer_idx=0)
+        cache.prune_after_chunk()
+
+        # Cache must hold exactly 20 active tokens (50% overall retention)
+        self.assertEqual(cache.get_seq_length(0), 20)
+        self.assertEqual(len(cache.layers[0].original_positions), 20)
+
+        prompt_token_ids = list(range(40))
+        sample_meta = {"id": "h2o_sample_01", "task_type": "cross_session_reasoning"}
+
+        # Run diagnostic inspection with baseline_correct=True, but current technique failed
+        res = inspect_sample_diagnostic(
+            cache=cache,
+            prompt_text="User: Past premise\n\n[Session Break]\n\nUser: Recent question",
+            prompt_token_ids=prompt_token_ids,
+            sample_meta=sample_meta,
+            is_correct=False,
+            baseline_correct=True,
+            tokenizer=None,
+            bits_per_scalar=16.0,
+        )
+
+        self.assertEqual(res.causal_verdict, "QUALITY_REGRESSION")
+        self.assertEqual(res.overall_retention_ratio, 0.5)
+        self.assertEqual(res.overall_effective_bitwidth, 8.0)
+        self.assertIsNotNone(res.session_retention_ratios)
+
 
 if __name__ == "__main__":
     unittest.main()
