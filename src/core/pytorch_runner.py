@@ -47,6 +47,7 @@ class PyTorchRequestOutput:
     outputs: list[PyTorchCompletionOutput]
     finished: bool = True
     metrics: PyTorchRequestMetrics | None = None
+    diagnostics: Any = None
 
 
 class PyTorchRunner:
@@ -114,6 +115,7 @@ class PyTorchRunner:
         max_tokens: int = 64,
         logprobs_topk: int = 5,
         chunk_size: int = 1024,
+        post_hoc_hook: Any = None,
     ) -> list[PyTorchRequestOutput]:
         """Execute autoregressive generation across requested prompts."""
         if isinstance(prompts, str):
@@ -294,6 +296,11 @@ class PyTorchRunner:
                 outputs=[comp],
                 metrics=metrics,
             )
+            if post_hoc_hook is not None:
+                try:
+                    req_out.diagnostics = post_hoc_hook(cache, req_idx, req_out)
+                except Exception as hook_err:
+                    req_out.diagnostics = {"error": str(hook_err)}
             request_outputs.append(req_out)
 
             # Explicit cleanup of per-request GPU tensors to prevent allocator fragmentation

@@ -96,6 +96,8 @@ class H2OLayer(DynamicLayer):
         self.heavy_hitter_tokens = int(heavy_hitter_tokens)
         self.recent_window_tokens = int(recent_window_tokens)
         self.cumulative_scores: torch.Tensor | None = None
+        self.original_positions: list[int] = []
+        self.total_tokens_seen: int = 0
 
     def update(
         self, key_states: torch.Tensor, value_states: torch.Tensor, *args: Any, **kwargs: Any
@@ -108,6 +110,8 @@ class H2OLayer(DynamicLayer):
         self.values = torch.cat([self.values, value_states], dim=-2)
 
         new_tokens = key_states.shape[-2]
+        self.original_positions.extend(range(self.total_tokens_seen, self.total_tokens_seen + new_tokens))
+        self.total_tokens_seen += new_tokens
         batch = key_states.shape[0]
         num_kv_heads = key_states.shape[1]
 
@@ -153,6 +157,12 @@ class H2OLayer(DynamicLayer):
                     retained_indices=boundary.retained_indices,
                     seq_dim=-2,
                 )
+                if self.original_positions and len(self.original_positions) >= len(boundary.retained_indices):
+                    self.original_positions = [
+                        self.original_positions[i]
+                        for i in boundary.retained_indices
+                        if i < len(self.original_positions)
+                    ]
                 if self.cumulative_scores is not None:
                     idx_tensor = torch.tensor(
                         boundary.retained_indices, device=self.cumulative_scores.device, dtype=torch.long
