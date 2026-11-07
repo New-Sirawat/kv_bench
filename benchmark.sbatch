@@ -57,7 +57,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Default to primary pure dense model (qwen3-4b); accepts aliases (phi4-mini, qwen3.5-4b, etc.)
 MODEL="${1:-qwen3-4b}"
-TECHNIQUE="${TECHNIQUE:-h2o}"
+TECHNIQUE="${TECHNIQUE:-all}"
 ENGINE="${ENGINE:-pytorch}"
 RUN_FULL_SWEEP="${RUN_FULL_SWEEP:-1}"
 SKIP_HARDWARE_SWEEPS="${SKIP_HARDWARE_SWEEPS:-1}"
@@ -135,7 +135,7 @@ if [[ "$ENGINE" == "pytorch" ]]; then
     # 2. Technique Evaluation under PyTorch (e.g. H2O and StreamingLLM)
     # --------------------------------------------------------------------------
     TECH_LIST=("h2o" "streamingllm")
-    if [[ "$TECHNIQUE" != "all" && "$TECHNIQUE" != "baseline" && "$TECHNIQUE" != "h2o" ]]; then
+    if [[ "$TECHNIQUE" != "all" && "$TECHNIQUE" != "baseline" ]]; then
         TECH_LIST=("$TECHNIQUE")
     fi
 
