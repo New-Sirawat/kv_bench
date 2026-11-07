@@ -68,6 +68,27 @@ class TestDiagnosticModule(unittest.TestCase):
         s2_start = s1_end + len(delim_ids)
         self.assertEqual(ranges[2], (s2_start, len(prompt_token_ids)))
 
+    def test_parse_session_token_ranges_overlapping_delimiters(self):
+        class OverlappingTokenizer:
+            def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+                if text == "[Session Break]":
+                    return [10, 20]
+                elif text == "\n\n[Session Break]\n\n":
+                    return [9, 10, 20, 21]
+                return []
+
+            def decode(self, token_ids: list[int], skip_special_tokens: bool = True) -> str:
+                return "text"
+
+        tok = OverlappingTokenizer()
+        # [1, 2, 3] + [9, 10, 20, 21] + [4, 5, 6]
+        # Contains both inner [10, 20] and outer [9, 10, 20, 21]
+        prompt_tokens = [1, 2, 3, 9, 10, 20, 21, 4, 5, 6]
+        ranges = parse_session_token_ranges("prompt", prompt_tokens, tok)
+        self.assertEqual(len(ranges), 2)
+        self.assertEqual(ranges[0], (0, 3))
+        self.assertEqual(ranges[1], (7, 10))
+
     def test_parse_session_token_ranges_single_session_fallback(self):
         prompt_token_ids = list(range(50))
         tok = DummyTokenizer()

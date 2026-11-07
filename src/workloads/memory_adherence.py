@@ -61,6 +61,7 @@ class LongMemEvalWorkload(Workload):
         seed: int | None = None,
         length_tier: str | None = None,
         select_by_length: bool = False,
+        eval_reference: str | None = None,
     ):
         import random
 
@@ -70,6 +71,7 @@ class LongMemEvalWorkload(Workload):
         self.seed = seed
         self.length_tier = length_tier if length_tier != "all" else None
         self.select_by_length = select_by_length or (length_tier == "auto")
+        self.eval_reference = eval_reference
 
         with open(self.dataset_path, "r", encoding="utf-8") as f:
             all_samples: list[dict[str, Any]] = json.load(f)
@@ -180,6 +182,16 @@ class LongMemEvalWorkload(Workload):
 
             prompts.append(f"{prefix}{ctx_text}\nUser: {s['question']}\nAssistant:")
 
+        ref_correctness_by_id: dict[str, bool] = {}
+        if self.eval_reference and os.path.exists(self.eval_reference):
+            try:
+                from src.core.quality import load_quality_reference
+                ref_data = load_quality_reference(self.eval_reference)
+                ctx_ref = ref_data.get("contexts", {}).get(str(context_length), {})
+                ref_correctness_by_id = ctx_ref.get("sample_correctness", {})
+            except Exception:
+                ref_correctness_by_id = {}
+
         diagnostic_records = []
         def _post_hoc_diag_hook(cache: Any, req_idx: int, req_out: Any) -> dict[str, Any] | None:
             if req_idx < len(active_samples):
@@ -192,6 +204,9 @@ class LongMemEvalWorkload(Workload):
                     is_unanswerable=sample.get("unanswerable", False),
                     refusal_triggers=REFUSAL_TRIGGERS,
                 )
+                baseline_correct = ref_correctness_by_id.get(
+                    sample.get("id"), sample.get("baseline_correct", None)
+                )
                 from src.core.diagnostic import inspect_sample_diagnostic
                 diag = inspect_sample_diagnostic(
                     cache=cache,
@@ -199,7 +214,7 @@ class LongMemEvalWorkload(Workload):
                     prompt_token_ids=req_out.prompt_token_ids,
                     sample_meta=sample,
                     is_correct=is_correct,
-                    baseline_correct=sample.get("baseline_correct", None),
+                    baseline_correct=baseline_correct,
                     tokenizer=tok,
                 )
                 diagnostic_records.append(diag)
@@ -266,6 +281,19 @@ class LongMemEvalWorkload(Workload):
             tier_scores.setdefault(tier, []).append(is_correct)
         eval_summary["tier_accuracy"] = {
             t: round(sum(scores) / len(scores), 4) for t, scores in sorted(tier_scores.items()) if scores
+        }
+        eval_summary["sample_correctness"] = {
+            sample.get("id", f"sample_{idx}"): score_longmemeval_sample(
+                pred,
+                sample.get("expected_answer", ""),
+                is_unanswerable=sample.get("unanswerable", False),
+                refusal_triggers=REFUSAL_TRIGGERS,
+            )
+            for idx, (sample, pred) in enumerate(zip(active_samples, predictions))
+        }
+        eval_summary["sample_predictions"] = {
+            sample.get("id", f"sample_{idx}"): pred
+            for idx, (sample, pred) in enumerate(zip(active_samples, predictions))
         }
 
         if diagnostic_records:

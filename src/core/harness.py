@@ -279,12 +279,18 @@ def run_benchmark(
 
             # Record reference generation if requested
             if save_reference:
-                reference_records[str(ctx)] = {
+                record = {
                     "token_ids": getattr(output, "generated_token_ids", []),
                     "step_logprobs": getattr(output, "step_logprobs", []),
                     "prompt_tokens": output.prompt_tokens,
                     "generated_tokens": output.generated_tokens,
                 }
+                if hasattr(output, "extra_summary") and isinstance(output.extra_summary, dict):
+                    if "sample_correctness" in output.extra_summary:
+                        record["sample_correctness"] = output.extra_summary["sample_correctness"]
+                    if "sample_predictions" in output.extra_summary:
+                        record["sample_predictions"] = output.extra_summary["sample_predictions"]
+                reference_records[str(ctx)] = record
 
             memcpy_bytes_per_token = 0.0
             if trace_path:

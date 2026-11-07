@@ -84,19 +84,24 @@ def parse_session_token_ranges(
                 else:
                     i += 1
 
-    # Sort spans and deduplicate
-    delimiter_spans = sorted(list(set(delimiter_spans)), key=lambda s: s[0])
+    # Sort and merge overlapping or contiguous delimiter spans
+    merged_delimiters: list[tuple[int, int]] = []
+    for s_start, s_end in sorted(delimiter_spans, key=lambda s: s[0]):
+        if not merged_delimiters or s_start > merged_delimiters[-1][1]:
+            merged_delimiters.append((s_start, s_end))
+        else:
+            merged_delimiters[-1] = (merged_delimiters[-1][0], max(merged_delimiters[-1][1], s_end))
 
-    if not delimiter_spans:
+    if not merged_delimiters:
         return [(0, total_tokens)]
 
     ranges: list[tuple[int, int]] = []
     current_pos = 0
 
-    for d_start, d_end in delimiter_spans:
+    for d_start, d_end in merged_delimiters:
         if d_start > current_pos:
             ranges.append((current_pos, d_start))
-        current_pos = d_end
+        current_pos = max(current_pos, d_end)
 
     if current_pos < total_tokens:
         ranges.append((current_pos, total_tokens))

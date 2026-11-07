@@ -345,6 +345,7 @@ Examples:
             "seed": args.seed,
             "length_tier": args.length_tier,
             "select_by_length": args.select_by_length,
+            "eval_reference": args.eval_reference,
         }
         if args.dataset_path:
             kw["dataset_path"] = args.dataset_path
