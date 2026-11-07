@@ -132,6 +132,44 @@ class TestStreamingCache(unittest.TestCase):
         self.assertEqual(len(res), 1)
         self.assertEqual(len(res[0].outputs[0].token_ids), 16)
 
+    def test_streaming_cache_diagnostic_inspection(self):
+        from src.core.diagnostic import inspect_sample_diagnostic
+
+        # Capacity: 4 sink tokens + 16 window tokens = 20 tokens
+        cache = StreamingCache(sink_tokens=4, window_size=16)
+        batch, num_kv_heads, head_dim = 1, 2, 32
+
+        # Feed 40 tokens across 2 sessions (20 tokens in S0, 20 tokens in S1)
+        k = torch.randn(batch, num_kv_heads, 40, head_dim, dtype=torch.bfloat16)
+        v = torch.randn(batch, num_kv_heads, 40, head_dim, dtype=torch.bfloat16)
+        cache.update(k, v, layer_idx=0)
+        cache.prune_after_chunk()
+
+        self.assertEqual(cache.get_seq_length(0), 20)
+        self.assertEqual(len(cache.layers[0].original_positions), 20)
+        # Positions should be first 4 sinks [0, 1, 2, 3] + last 16 [24 ... 39]
+        expected_positions = list(range(4)) + list(range(24, 40))
+        self.assertEqual(cache.layers[0].original_positions, expected_positions)
+
+        prompt_token_ids = list(range(40))
+        sample_meta = {"id": "streaming_sample_01", "task_type": "cross_session_reasoning"}
+
+        res = inspect_sample_diagnostic(
+            cache=cache,
+            prompt_text="User: Past premise\n\n[Session Break]\n\nUser: Recent question",
+            prompt_token_ids=prompt_token_ids,
+            sample_meta=sample_meta,
+            is_correct=False,
+            baseline_correct=True,
+            tokenizer=None,
+            bits_per_scalar=16.0,
+        )
+
+        self.assertEqual(res.causal_verdict, "QUALITY_REGRESSION")
+        self.assertEqual(res.overall_retention_ratio, 0.5)
+        self.assertEqual(res.overall_effective_bitwidth, 8.0)
+        self.assertIsNotNone(res.session_retention_ratios)
+
 
 if __name__ == "__main__":
     unittest.main()

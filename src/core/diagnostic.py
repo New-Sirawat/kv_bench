@@ -1,8 +1,9 @@
-"""Unified Diagnostic KV-Cache Profiler & Multi-Layer Bitwidth Telemetry (Schema v2).
+"""Canonical Diagnostic KV-Cache Profiler & Multi-Layer Bitwidth Telemetry.
 
-Provides zero-bias, post-hoc inspection of active KV-cache tensors across transformer
-layers. Evaluates physical presence (retention ratio) and representation fidelity (effective
-bitwidth per scalar element) across conversation sessions with baseline-controlled causal attribution.
+Provides zero-bias, post-hoc physical inspection of active KV-cache tensors across
+transformer layers. Evaluates physical presence (retention ratio) and continuous
+representation budget (effective bitwidth per scalar element) across conversation sessions
+with baseline-controlled causal attribution.
 """
 
 from __future__ import annotations
@@ -121,10 +122,12 @@ def extract_active_positions_per_layer(cache: Any, total_tokens: int) -> list[se
     layer_positions: list[set[int]] = []
     for layer in layers:
         orig = getattr(layer, "original_positions", None)
-        if orig is not None and isinstance(orig, list) and len(orig) > 0:
+        if orig is not None and isinstance(orig, (list, set)):
             layer_positions.append(set(orig))
+        elif hasattr(layer, "get_active_positions"):
+            layer_positions.append(set(layer.get_active_positions(total_tokens)))
         else:
-            # Fallback (e.g. uncompressed DynamicCache): all tokens retained
+            # Fallback for untracked caches (e.g. uncompressed DynamicCache): all tokens retained
             layer_positions.append(set(range(total_tokens)))
 
     return layer_positions
@@ -165,8 +168,6 @@ def inspect_sample_diagnostic(
     session_content_retention: list[float] = []
     session_syntax_retention: list[float] = []
 
-    total_active_token_layer_instances = 0
-
     for s_start, s_end in session_ranges:
         s_count = max(0, s_end - s_start)
         session_token_counts.append(s_count)
@@ -181,7 +182,6 @@ def inspect_sample_diagnostic(
 
         for l_pos in layer_positions:
             retained_in_layer = len(l_pos & s_indices)
-            total_active_token_layer_instances += retained_in_layer
             retained_s = retained_in_layer / s_len
             layer_overall.append(retained_s)
 
@@ -203,9 +203,11 @@ def inspect_sample_diagnostic(
         session_content_retention.append(round(sum(layer_content) / len(layer_content), 4))
         session_syntax_retention.append(round(sum(layer_syntax) / len(layer_syntax), 4))
 
-    # Overall physical metrics across all tokens
+    # Overall physical prompt token retention across all layers (exact prompt token set)
+    prompt_token_set = set(range(total_tokens))
+    total_active_instances = sum(len(l_pos & prompt_token_set) for l_pos in layer_positions)
     max_possible_instances = max(1, total_tokens * layers_total)
-    overall_retention_ratio = round(total_active_token_layer_instances / max_possible_instances, 4)
+    overall_retention_ratio = round(total_active_instances / max_possible_instances, 4)
     overall_effective_bitwidth = round(overall_retention_ratio * bits_per_scalar, 2)
     min_session_effective_bitwidth = (
         min(session_effective_bitwidths) if session_effective_bitwidths else overall_effective_bitwidth
@@ -249,7 +251,7 @@ def inspect_sample_diagnostic(
 
 
 def summarize_diagnostic_results(results: list[DiagnosticResult]) -> dict[str, Any]:
-    """Aggregate DiagnosticResults into Schema v2 benchmark telemetry with backward-compatible aliases."""
+    """Aggregate DiagnosticResults into canonical benchmark telemetry."""
     if not results:
         return {}
 
@@ -262,8 +264,11 @@ def summarize_diagnostic_results(results: list[DiagnosticResult]) -> dict[str, A
     overall_bitwidths = [r.overall_effective_bitwidth for r in results]
     min_bitwidths = [r.min_session_effective_bitwidth for r in results]
 
+    mean_bitwidth = (
+        round(sum(overall_bitwidths) / len(overall_bitwidths), 2) if overall_bitwidths else 16.0
+    )
+
     summary: dict[str, Any] = {
-        "diag_schema_version": 2,
         "diag_total_inspected": total,
         "diag_pass_count": verdict_counts.get("PASS_FIDELITY_MAINTAINED", 0),
         "diag_quality_regression_count": verdict_counts.get("QUALITY_REGRESSION", 0),
@@ -272,23 +277,12 @@ def summarize_diagnostic_results(results: list[DiagnosticResult]) -> dict[str, A
         "diag_mean_overall_retention_ratio": (
             round(sum(overall_retentions) / len(overall_retentions), 4) if overall_retentions else 1.0
         ),
-        "diag_mean_overall_effective_bitwidth": (
-            round(sum(overall_bitwidths) / len(overall_bitwidths), 2) if overall_bitwidths else 16.0
-        ),
+        "diag_mean_overall_effective_bitwidth": mean_bitwidth,
         "diag_mean_min_session_effective_bitwidth": (
             round(sum(min_bitwidths) / len(min_bitwidths), 2) if min_bitwidths else 16.0
         ),
-        # Legacy backward-compatibility aliases
-        "diag_ancient_session_starvation_count": verdict_counts.get("QUALITY_REGRESSION", 0),
-        "diag_target_evicted_count": 0,
-        "diag_cognitive_reasoning_failure_count": verdict_counts.get("BASELINE_LIMITATION", 0),
-        "diag_partial_layer_eviction_count": verdict_counts.get("INCORRECT_STANDALONE", 0),
-        "diag_mean_ancient_content_retention": (
-            round(sum(min_bitwidths) / len(min_bitwidths) / 16.0, 4) if min_bitwidths else 1.0
+        "diag_mean_compression_ratio": (
+            round(16.0 / max(0.01, mean_bitwidth), 2) if mean_bitwidth > 0 else 0.0
         ),
-        "diag_mean_recent_content_retention": (
-            round(sum(overall_retentions) / len(overall_retentions), 4) if overall_retentions else 1.0
-        ),
-        "diag_mean_target_survival_ratio": None,
     }
     return summary
