@@ -132,60 +132,67 @@ if [[ "$ENGINE" == "pytorch" ]]; then
     fi
 
     # --------------------------------------------------------------------------
-    # 2. Technique Evaluation under PyTorch (e.g. H2O)
+    # 2. Technique Evaluation under PyTorch (e.g. H2O and StreamingLLM)
     # --------------------------------------------------------------------------
-    echo ">> [PyTorch Technique: $TECHNIQUE] Step 0: Verification (128 ctx, 16 tokens)..."
-    uv run --no-sync main.py \
-        --technique "$TECHNIQUE" \
-        --engine pytorch \
-        --model "$MODEL" \
-        --verify \
-        --max-vram-gb 16.0 \
-        --eval-reference "$VERIFY_REF" \
-        --output "results/verify_${TECHNIQUE}_pytorch_16gb.json"
-
-    if [[ "$RUN_FULL_SWEEP" == "1" ]]; then
-        if [[ "$SKIP_HARDWARE_SWEEPS" != "1" ]]; then
-            echo ">> [PyTorch Technique: $TECHNIQUE] Step 1: Scaling Sweep (512 - 32768) evaluated against Macro Reference..."
-            uv run --no-sync main.py \
-                --technique "$TECHNIQUE" \
-                --engine pytorch \
-                --model "$MODEL" \
-                --contexts $CONTEXTS \
-                --max-vram-gb 16.0 \
-                --profile \
-                --eval-reference "$BASELINE_MACRO_REF" \
-                --output "results/${TECHNIQUE}_hardware_pytorch_16gb.json"
-        fi
-
-        echo ">> [PyTorch Technique: $TECHNIQUE] Step 2: Diagnostic LongMemEval Adherence & Causal Layer Retention (512 - 16384, Select by Length)..."
-        uv run --no-sync main.py \
-            --technique "$TECHNIQUE" \
-            --engine pytorch \
-            --model "$MODEL" \
-            --workload longmem \
-            --select-by-length \
-            --contexts $EVAL_CONTEXTS \
-            --max-tokens 32 \
-            --samples-per-task 10 \
-            --seed 42 \
-            --max-vram-gb 16.0 \
-            --eval-reference "$BASELINE_LONGMEM_REF" \
-            --output "results/${TECHNIQUE}_longmem_pytorch_16gb.json"
-
-        echo ">> [PyTorch Technique: $TECHNIQUE] Step 3: Opt-In Mechanistic 2D NIAH Sweep..."
-        uv run --no-sync main.py \
-            --technique "$TECHNIQUE" \
-            --engine pytorch \
-            --model "$MODEL" \
-            --workload niah \
-            --contexts $NIAH_CONTEXTS \
-            --max-tokens 16 \
-            --max-vram-gb 16.0 \
-            --output "results/${TECHNIQUE}_niah_pytorch_16gb.json"
+    TECH_LIST=("h2o" "streamingllm")
+    if [[ "$TECHNIQUE" != "all" && "$TECHNIQUE" != "baseline" && "$TECHNIQUE" != "h2o" ]]; then
+        TECH_LIST=("$TECHNIQUE")
     fi
 
-    echo "=== PyTorch Benchmark Pipeline for $TECHNIQUE Completed Successfully ==="
+    for CURRENT_TECH in "${TECH_LIST[@]}"; do
+        echo ">> [PyTorch Technique: $CURRENT_TECH] Step 0: Verification (128 ctx, 16 tokens)..."
+        uv run --no-sync main.py \
+            --technique "$CURRENT_TECH" \
+            --engine pytorch \
+            --model "$MODEL" \
+            --verify \
+            --max-vram-gb 16.0 \
+            --eval-reference "$VERIFY_REF" \
+            --output "results/verify_${CURRENT_TECH}_pytorch_16gb.json"
+
+        if [[ "$RUN_FULL_SWEEP" == "1" ]]; then
+            if [[ "$SKIP_HARDWARE_SWEEPS" != "1" ]]; then
+                echo ">> [PyTorch Technique: $CURRENT_TECH] Step 1: Scaling Sweep (512 - 32768) evaluated against Macro Reference..."
+                uv run --no-sync main.py \
+                    --technique "$CURRENT_TECH" \
+                    --engine pytorch \
+                    --model "$MODEL" \
+                    --contexts $CONTEXTS \
+                    --max-vram-gb 16.0 \
+                    --profile \
+                    --eval-reference "$BASELINE_MACRO_REF" \
+                    --output "results/${CURRENT_TECH}_hardware_pytorch_16gb.json"
+            fi
+
+            echo ">> [PyTorch Technique: $CURRENT_TECH] Step 2: Diagnostic LongMemEval Adherence & Causal Layer Retention (512 - 16384, Select by Length)..."
+            uv run --no-sync main.py \
+                --technique "$CURRENT_TECH" \
+                --engine pytorch \
+                --model "$MODEL" \
+                --workload longmem \
+                --select-by-length \
+                --contexts $EVAL_CONTEXTS \
+                --max-tokens 32 \
+                --samples-per-task 10 \
+                --seed 42 \
+                --max-vram-gb 16.0 \
+                --eval-reference "$BASELINE_LONGMEM_REF" \
+                --output "results/${CURRENT_TECH}_longmem_pytorch_16gb.json"
+
+            echo ">> [PyTorch Technique: $CURRENT_TECH] Step 3: Opt-In Mechanistic 2D NIAH Sweep..."
+            uv run --no-sync main.py \
+                --technique "$CURRENT_TECH" \
+                --engine pytorch \
+                --model "$MODEL" \
+                --workload niah \
+                --contexts $NIAH_CONTEXTS \
+                --max-tokens 16 \
+                --max-vram-gb 16.0 \
+                --output "results/${CURRENT_TECH}_niah_pytorch_16gb.json"
+        fi
+
+        echo "=== PyTorch Benchmark Pipeline for $CURRENT_TECH Completed Successfully ==="
+    done
     exit 0
 fi
 
