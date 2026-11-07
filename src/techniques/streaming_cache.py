@@ -26,8 +26,17 @@ class StreamingLayer(DynamicLayer):
 
         self.sink_tokens = int(sink_tokens)
         self.window_size = int(window_size)
-        self.original_positions: list[int] = []
         self.total_tokens_seen: int = 0
+
+    @property
+    def original_positions(self) -> list[int]:
+        """Compute active original prompt token positions deterministically on demand."""
+        if self.total_tokens_seen <= self.sink_tokens + self.window_size:
+            return list(range(self.total_tokens_seen))
+        return (
+            list(range(self.sink_tokens))
+            + list(range(self.total_tokens_seen - self.window_size, self.total_tokens_seen))
+        )
 
     def update(
         self, key_states: torch.Tensor, value_states: torch.Tensor, *args: Any, **kwargs: Any
@@ -40,7 +49,6 @@ class StreamingLayer(DynamicLayer):
         self.values = torch.cat([self.values, value_states], dim=-2)
 
         new_tokens = key_states.shape[-2]
-        self.original_positions.extend(range(self.total_tokens_seen, self.total_tokens_seen + new_tokens))
         self.total_tokens_seen += new_tokens
 
         # In autoregressive decode phase (seq_len == 1), evict immediately to clamp memory
@@ -52,11 +60,6 @@ class StreamingLayer(DynamicLayer):
                 window_size=self.window_size,
                 seq_dim=-2,
             )
-            if len(self.original_positions) > self.sink_tokens + self.window_size:
-                self.original_positions = (
-                    self.original_positions[: self.sink_tokens]
-                    + self.original_positions[-self.window_size :]
-                )
 
         return self.keys, self.values
 
@@ -70,11 +73,6 @@ class StreamingLayer(DynamicLayer):
                 window_size=self.window_size,
                 seq_dim=-2,
             )
-            if len(self.original_positions) > self.sink_tokens + self.window_size:
-                self.original_positions = (
-                    self.original_positions[: self.sink_tokens]
-                    + self.original_positions[-self.window_size :]
-                )
 
     def get_max_length(self) -> int:
         return self.sink_tokens + self.window_size
@@ -100,8 +98,6 @@ class StreamingCache(Cache):
 
         self.sink_tokens = int(sink_tokens)
         self.window_size = int(window_size)
-        self.original_positions: list[int] = []
-        self.total_tokens_seen: int = 0
 
         super().__init__(
             layer_class_to_replicate=lambda: StreamingLayer(
@@ -109,6 +105,13 @@ class StreamingCache(Cache):
                 window_size=self.window_size,
             )
         )
+
+    @property
+    def original_positions(self) -> list[int]:
+        """Compute active positions across layer 0 for cache-level inspection."""
+        if not self.layers:
+            return []
+        return self.layers[0].original_positions
 
     def prune_after_chunk(self) -> None:
         """Evict middle tokens across all initialized layers after prefill chunk processing."""

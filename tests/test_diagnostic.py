@@ -109,6 +109,44 @@ class TestDiagnosticModule(unittest.TestCase):
         self.assertEqual(positions[0], {0, 1, 2, 5, 6})
         self.assertEqual(positions[1], {0, 1, 3, 7, 8})
 
+        # Catastrophic eviction (0 tokens retained) must yield empty set, NOT fallback
+        mock_empty_layer = MagicMock()
+        mock_empty_layer.original_positions = []
+        mock_empty_cache = MagicMock()
+        mock_empty_cache.layers = [mock_empty_layer]
+        empty_positions = extract_active_positions_per_layer(mock_empty_cache, total_tokens=10)
+        self.assertEqual(len(empty_positions), 1)
+        self.assertEqual(empty_positions[0], set())
+
+    def test_baseline_diagnostic_inspection_exact_unity_retention(self):
+        tok = DummyTokenizer()
+        delim_str = "[Session Break]"
+        delim_ids = tok.encode(delim_str, add_special_tokens=False)
+
+        prompt_tokens = [1, 2, 3] + delim_ids + [4, 5, 6, 7]
+        prompt_text = "Session 0 [Session Break] Session 1"
+
+        # Baseline cache (DynamicCache has no original_positions attribute)
+        mock_baseline_cache = MagicMock()
+        mock_layer = MagicMock(spec=[])  # no original_positions
+        mock_baseline_cache.layers = [mock_layer]
+
+        res = inspect_sample_diagnostic(
+            cache=mock_baseline_cache,
+            prompt_text=prompt_text,
+            prompt_token_ids=prompt_tokens,
+            sample_meta={"id": "base_01", "task_type": "fact_recall"},
+            is_correct=True,
+            baseline_correct=True,
+            tokenizer=tok,
+            bits_per_scalar=16.0,
+        )
+
+        self.assertEqual(res.overall_retention_ratio, 1.0)
+        self.assertEqual(res.overall_effective_bitwidth, 16.0)
+        self.assertEqual(res.causal_verdict, "PASS_FIDELITY_MAINTAINED")
+        self.assertIsNone(res.most_degraded_session_idx)
+
     def test_baseline_controlled_causal_verdicts(self):
         tok = DummyTokenizer()
         mock_cache = MagicMock()
@@ -225,7 +263,7 @@ class TestDiagnosticModule(unittest.TestCase):
         self.assertEqual(res.most_degraded_session_idx, 0)
         self.assertEqual(res.causal_verdict, "QUALITY_REGRESSION")
 
-    def test_summarize_diagnostic_results_schema_v2(self):
+    def test_summarize_diagnostic_results_canonical(self):
         diag1 = DiagnosticResult(
             sample_id="s1",
             task_type="fact_recall",
@@ -277,15 +315,17 @@ class TestDiagnosticModule(unittest.TestCase):
 
         summary = summarize_diagnostic_results([diag1, diag2, diag3])
 
-        self.assertEqual(summary["diag_schema_version"], 2)
+        self.assertNotIn("diag_schema_version", summary)
+        self.assertNotIn("diag_ancient_session_starvation_count", summary)
         self.assertEqual(summary["diag_total_inspected"], 3)
         self.assertEqual(summary["diag_pass_count"], 1)
         self.assertEqual(summary["diag_quality_regression_count"], 1)
         self.assertEqual(summary["diag_baseline_limitation_count"], 1)
-        self.assertEqual(summary["diag_ancient_session_starvation_count"], 1)  # Legacy alias
+        self.assertEqual(summary["diag_incorrect_standalone_count"], 0)
         self.assertAlmostEqual(summary["diag_mean_overall_retention_ratio"], 0.8333, places=3)
         self.assertAlmostEqual(summary["diag_mean_overall_effective_bitwidth"], 13.33, places=2)
         self.assertAlmostEqual(summary["diag_mean_min_session_effective_bitwidth"], 11.20, places=2)
+        self.assertAlmostEqual(summary["diag_mean_compression_ratio"], 1.20, places=2)
 
 
 class TestNIAHWorkload(unittest.TestCase):
