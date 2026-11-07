@@ -60,6 +60,17 @@ def fetch_url_bytes(url: str, timeout: int = 60) -> bytes:
         return resp.read()
 
 
+def classify_length_tier(words: int) -> tuple[int, str]:
+    """Classify context word count into approximate token count and length tier."""
+    approx_tokens = int(words * 1.35)
+    if approx_tokens <= 2500:
+        return approx_tokens, "short"
+    elif approx_tokens <= 8000:
+        return approx_tokens, "medium"
+    else:
+        return approx_tokens, "long"
+
+
 def format_haystack_context(haystack_sessions: list[list[dict[str, Any]]]) -> str:
     """Format nested multi-session turns into unified dialogue string."""
     session_blocks = []
@@ -140,6 +151,8 @@ def generate_mock_longmemeval(samples_per_task: int = 2) -> list[dict[str, Any]]
                 answer = "not mentioned"
                 unanswerable = True
 
+            words = len(context.split())
+            approx_tok, tier = classify_length_tier(words)
             records.append({
                 "id": sample_id,
                 "task_type": task,
@@ -147,6 +160,9 @@ def generate_mock_longmemeval(samples_per_task: int = 2) -> list[dict[str, Any]]
                 "question": question,
                 "expected_answer": answer,
                 "unanswerable": unanswerable,
+                "word_count": words,
+                "approx_tokens": approx_tok,
+                "length_tier": tier,
             })
     return records
 
@@ -215,6 +231,8 @@ def stage_longmemeval(
             if not question or not answer or not context:
                 continue
 
+            words = len(context.split())
+            approx_tok, tier = classify_length_tier(words)
             entry = {
                 "id": q_id,
                 "task_type": mapped_type,
@@ -222,6 +240,9 @@ def stage_longmemeval(
                 "question": question,
                 "expected_answer": answer,
                 "unanswerable": False,
+                "word_count": words,
+                "approx_tokens": approx_tok,
+                "length_tier": tier,
             }
             grouped[mapped_type].append(entry)
 
@@ -230,6 +251,8 @@ def stage_longmemeval(
         unanswerable_pool = []
         for i in range(min(target_samples_per_task, len(grouped["fact_recall"]))):
             source_context = grouped["fact_recall"][i]["context"]
+            u_words = len(source_context.split())
+            u_approx, u_tier = classify_length_tier(u_words)
             # Query about completely unrelated knowledge not in the context
             unanswerable_pool.append({
                 "id": f"ur_abs_{i+1:02d}",
@@ -238,6 +261,9 @@ def stage_longmemeval(
                 "question": "What is the secret Wi-Fi password and network configuration of the lab?",
                 "expected_answer": "not mentioned",
                 "unanswerable": True,
+                "word_count": u_words,
+                "approx_tokens": u_approx,
+                "length_tier": u_tier,
             })
         grouped["unanswerable_refusal"] = unanswerable_pool
 

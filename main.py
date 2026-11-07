@@ -104,6 +104,10 @@ def run_isolated_sweep(args, contexts: list[int], max_tokens: int, output_path: 
                 cmd.extend(["--max-samples", str(args.max_samples)])
             if args.dataset_path:
                 cmd.extend(["--dataset-path", args.dataset_path])
+            if getattr(args, "length_tier", "all") != "all":
+                cmd.extend(["--length-tier", args.length_tier])
+            if getattr(args, "select_by_length", False):
+                cmd.append("--select-by-length")
             if tmp_ref:
                 cmd.extend(["--save-reference", tmp_ref])
             if args.eval_reference:
@@ -191,9 +195,9 @@ Examples:
     )
     parser.add_argument(
         "--workload",
-        choices=["default", "filler", "coldwarm", "concurrent", "longmem"],
+        choices=["default", "filler", "coldwarm", "concurrent", "longmem", "niah"],
         default="default",
-        help="Workload pattern: default (use technique default), filler (single prompt), coldwarm (prefix reuse), concurrent (10-15 simulated users), longmem (LongMemEval adherence)",
+        help="Workload pattern: default (use technique default), filler (single prompt), coldwarm (prefix reuse), concurrent (10-15 simulated users), longmem (LongMemEval adherence), niah (Needle-In-A-Haystack)",
     )
     parser.add_argument(
         "--num-users",
@@ -255,6 +259,17 @@ Examples:
         "--dataset-path",
         default=None,
         help="Custom dataset path for workloads like longmem",
+    )
+    parser.add_argument(
+        "--length-tier",
+        choices=["all", "short", "medium", "long", "auto"],
+        default="all",
+        help="Filter LongMemEval samples by length tier: short (<=2.5K tok), medium (2.5K-8K tok), long (>8K tok), auto (match each context length), or all (default)",
+    )
+    parser.add_argument(
+        "--select-by-length",
+        action="store_true",
+        help="Dynamically select LongMemEval samples matching each context length in the sweep",
     )
     parser.add_argument(
         "--save-reference",
@@ -328,10 +343,16 @@ Examples:
             "samples_per_task": args.samples_per_task,
             "max_samples": args.max_samples,
             "seed": args.seed,
+            "length_tier": args.length_tier,
+            "select_by_length": args.select_by_length,
+            "eval_reference": args.eval_reference,
         }
         if args.dataset_path:
             kw["dataset_path"] = args.dataset_path
         workload_override = LongMemEvalWorkload(**kw)
+    elif args.workload == "niah":
+        from src.workloads.niah import NIAHWorkload
+        workload_override = NIAHWorkload()
 
 
 

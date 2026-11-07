@@ -26,6 +26,8 @@ class StreamingLayer(DynamicLayer):
 
         self.sink_tokens = int(sink_tokens)
         self.window_size = int(window_size)
+        self.original_positions: list[int] = []
+        self.total_tokens_seen: int = 0
 
     def update(
         self, key_states: torch.Tensor, value_states: torch.Tensor, *args: Any, **kwargs: Any
@@ -37,6 +39,10 @@ class StreamingLayer(DynamicLayer):
         self.keys = torch.cat([self.keys, key_states], dim=-2)
         self.values = torch.cat([self.values, value_states], dim=-2)
 
+        new_tokens = key_states.shape[-2]
+        self.original_positions.extend(range(self.total_tokens_seen, self.total_tokens_seen + new_tokens))
+        self.total_tokens_seen += new_tokens
+
         # In autoregressive decode phase (seq_len == 1), evict immediately to clamp memory
         if key_states.shape[-2] == 1:
             self.keys, self.values = evict_streaming_kv_cache(
@@ -46,6 +52,11 @@ class StreamingLayer(DynamicLayer):
                 window_size=self.window_size,
                 seq_dim=-2,
             )
+            if len(self.original_positions) > self.sink_tokens + self.window_size:
+                self.original_positions = (
+                    self.original_positions[: self.sink_tokens]
+                    + self.original_positions[-self.window_size :]
+                )
 
         return self.keys, self.values
 
@@ -59,6 +70,11 @@ class StreamingLayer(DynamicLayer):
                 window_size=self.window_size,
                 seq_dim=-2,
             )
+            if len(self.original_positions) > self.sink_tokens + self.window_size:
+                self.original_positions = (
+                    self.original_positions[: self.sink_tokens]
+                    + self.original_positions[-self.window_size :]
+                )
 
     def get_max_length(self) -> int:
         return self.sink_tokens + self.window_size
@@ -84,6 +100,8 @@ class StreamingCache(Cache):
 
         self.sink_tokens = int(sink_tokens)
         self.window_size = int(window_size)
+        self.original_positions: list[int] = []
+        self.total_tokens_seen: int = 0
 
         super().__init__(
             layer_class_to_replicate=lambda: StreamingLayer(

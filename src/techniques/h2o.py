@@ -419,11 +419,12 @@ def _install_vllm_h2o_hooks() -> None:
 
 
 _PYTORCH_HOOKS_INSTALLED: bool = False
+_ORIG_SDPA: Any = None
 
 
 def _install_pytorch_h2o_hooks() -> None:
     """Install attention wrapper into transformers ALL_ATTENTION_FUNCTIONS for H2O."""
-    global _PYTORCH_HOOKS_INSTALLED
+    global _PYTORCH_HOOKS_INSTALLED, _ORIG_SDPA
     if _PYTORCH_HOOKS_INSTALLED:
         return
 
@@ -437,8 +438,10 @@ def _install_pytorch_h2o_hooks() -> None:
     if orig_sdpa is None:
         return
 
+    _ORIG_SDPA = orig_sdpa
+
     def h2o_sdpa_attention_forward(module, query, key, value, *args, **kwargs):
-        output, attn_weights = orig_sdpa(module, query, key, value, *args, **kwargs)
+        output, attn_weights = _ORIG_SDPA(module, query, key, value, *args, **kwargs)
 
         cache = get_active_h2o_cache()
         if cache is not None and getattr(cache, "is_h2o", False):
@@ -454,6 +457,20 @@ def _install_pytorch_h2o_hooks() -> None:
 
     ALL_ATTENTION_FUNCTIONS.register("sdpa", h2o_sdpa_attention_forward)
     _PYTORCH_HOOKS_INSTALLED = True
+
+
+def _uninstall_pytorch_h2o_hooks() -> None:
+    """Restore original sdpa attention forward in transformers ALL_ATTENTION_FUNCTIONS."""
+    global _PYTORCH_HOOKS_INSTALLED, _ORIG_SDPA
+    if not _PYTORCH_HOOKS_INSTALLED or _ORIG_SDPA is None:
+        return
+    try:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        ALL_ATTENTION_FUNCTIONS.register("sdpa", _ORIG_SDPA)
+        _PYTORCH_HOOKS_INSTALLED = False
+        _ORIG_SDPA = None
+    except ImportError:
+        pass
 
 
 @register("h2o")

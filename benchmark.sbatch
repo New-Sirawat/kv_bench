@@ -3,6 +3,7 @@
 #SBATCH --output=slurm-%j.log
 #SBATCH --partition=gpu4090
 #SBATCH --gres=gpu:rtx4090:1
+#SBATCH --exclude=gpu01.slurm.cpe.kmutt.ac.th
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=02:00:00
@@ -59,38 +60,132 @@ MODEL="${1:-qwen3-4b}"
 TECHNIQUE="${TECHNIQUE:-h2o}"
 ENGINE="${ENGINE:-pytorch}"
 RUN_FULL_SWEEP="${RUN_FULL_SWEEP:-1}"
-SKIP_HARDWARE_SWEEPS="${SKIP_HARDWARE_SWEEPS:-0}"
+SKIP_HARDWARE_SWEEPS="${SKIP_HARDWARE_SWEEPS:-1}"
 CONTEXTS="512 1024 2048 4096 8192 16384 32768"
 CONCURRENT_CONTEXTS="1024 2048 4096 8192"
 CONCURRENT_USERS="1 4 8 12 16"
-EVAL_CONTEXTS="512 1024 2048 4096"
+EVAL_CONTEXTS="512 1024 2048 4096 8192 16384"
+NIAH_CONTEXTS="2048 4096"
+FORCE_LONGMEM_REF="${FORCE_LONGMEM_REF:-1}"
 
 echo "Model Selected:     $MODEL"
 echo "Technique Selected: $TECHNIQUE"
 echo "Engine Selected:    $ENGINE"
 
-if [[ "$TECHNIQUE" == "baseline" && "$ENGINE" == "pytorch" ]]; then
-    echo ">> Running PyTorch Baseline Verification (128 ctx, 16 tokens, 16.0 GB VRAM cap)..."
-    uv run --no-sync main.py \
-        --technique baseline \
-        --engine pytorch \
-        --model "$MODEL" \
-        --verify \
-        --max-vram-gb 16.0 \
-        --save-reference results/references/verify_ref_pytorch.json \
-        --output results/verify_baseline_pytorch_16gb.json
+# ==============================================================================
+# PyTorch Scientific Control Pipeline (WP1-4-1 Diagnostic Testbed)
+# ==============================================================================
+if [[ "$ENGINE" == "pytorch" ]]; then
+    # --------------------------------------------------------------------------
+    # 1. Baseline PyTorch Reference Generation (if missing or technique is baseline)
+    # --------------------------------------------------------------------------
+    BASELINE_MACRO_REF="results/references/baseline_macro_pytorch_ref.json"
+    BASELINE_LONGMEM_REF="results/references/baseline_${MODEL}_pytorch_ref.json"
+    VERIFY_REF="results/references/verify_ref_pytorch.json"
 
-    if [[ "$RUN_FULL_SWEEP" == "1" ]]; then
-        echo ">> Running PyTorch Baseline Context Scaling Sweep (512 - 32768)..."
+    if [[ "$TECHNIQUE" == "baseline" || ! -f "$VERIFY_REF" ]]; then
+        echo ">> [PyTorch Baseline] Step 1: Verification & Verify Reference Capture..."
         uv run --no-sync main.py \
             --technique baseline \
             --engine pytorch \
             --model "$MODEL" \
-            --contexts $CONTEXTS \
+            --verify \
             --max-vram-gb 16.0 \
-            --output results/baseline_pytorch_16gb.json
+            --save-reference "$VERIFY_REF" \
+            --output results/verify_baseline_pytorch_16gb.json
     fi
-    echo "=== PyTorch Baseline Benchmark Run Completed Successfully ==="
+
+    if [[ "$RUN_FULL_SWEEP" == "1" ]]; then
+        if [[ ! -f "$BASELINE_MACRO_REF" ]]; then
+            echo ">> [PyTorch Baseline] Step 2: Context Scaling Sweep (512 - 32768) & Macro Reference Capture..."
+            uv run --no-sync main.py \
+                --technique baseline \
+                --engine pytorch \
+                --model "$MODEL" \
+                --contexts $CONTEXTS \
+                --max-vram-gb 16.0 \
+                --save-reference "$BASELINE_MACRO_REF" \
+                --output results/baseline_pytorch_16gb.json
+        fi
+
+        if [[ "$TECHNIQUE" == "baseline" || ! -f "$BASELINE_LONGMEM_REF" || "$FORCE_LONGMEM_REF" == "1" ]]; then
+            echo ">> [PyTorch Baseline] Step 3: LongMemEval Adherence & Reference Capture (512 - 16384, Select by Length)..."
+            uv run --no-sync main.py \
+                --technique baseline \
+                --engine pytorch \
+                --model "$MODEL" \
+                --workload longmem \
+                --select-by-length \
+                --contexts $EVAL_CONTEXTS \
+                --max-tokens 32 \
+                --samples-per-task 10 \
+                --seed 42 \
+                --max-vram-gb 16.0 \
+                --save-reference "$BASELINE_LONGMEM_REF" \
+                --output results/longmem_baseline_pytorch_16gb.json
+        fi
+    fi
+
+    if [[ "$TECHNIQUE" == "baseline" ]]; then
+        echo "=== PyTorch Baseline Benchmark Run Completed Successfully ==="
+        exit 0
+    fi
+
+    # --------------------------------------------------------------------------
+    # 2. Technique Evaluation under PyTorch (e.g. H2O)
+    # --------------------------------------------------------------------------
+    echo ">> [PyTorch Technique: $TECHNIQUE] Step 0: Verification (128 ctx, 16 tokens)..."
+    uv run --no-sync main.py \
+        --technique "$TECHNIQUE" \
+        --engine pytorch \
+        --model "$MODEL" \
+        --verify \
+        --max-vram-gb 16.0 \
+        --eval-reference "$VERIFY_REF" \
+        --output "results/verify_${TECHNIQUE}_pytorch_16gb.json"
+
+    if [[ "$RUN_FULL_SWEEP" == "1" ]]; then
+        if [[ "$SKIP_HARDWARE_SWEEPS" != "1" ]]; then
+            echo ">> [PyTorch Technique: $TECHNIQUE] Step 1: Scaling Sweep (512 - 32768) evaluated against Macro Reference..."
+            uv run --no-sync main.py \
+                --technique "$TECHNIQUE" \
+                --engine pytorch \
+                --model "$MODEL" \
+                --contexts $CONTEXTS \
+                --max-vram-gb 16.0 \
+                --profile \
+                --eval-reference "$BASELINE_MACRO_REF" \
+                --output "results/${TECHNIQUE}_hardware_pytorch_16gb.json"
+        fi
+
+        echo ">> [PyTorch Technique: $TECHNIQUE] Step 2: Diagnostic LongMemEval Adherence & Causal Layer Retention (512 - 16384, Select by Length)..."
+        uv run --no-sync main.py \
+            --technique "$TECHNIQUE" \
+            --engine pytorch \
+            --model "$MODEL" \
+            --workload longmem \
+            --select-by-length \
+            --contexts $EVAL_CONTEXTS \
+            --max-tokens 32 \
+            --samples-per-task 10 \
+            --seed 42 \
+            --max-vram-gb 16.0 \
+            --eval-reference "$BASELINE_LONGMEM_REF" \
+            --output "results/${TECHNIQUE}_longmem_pytorch_16gb.json"
+
+        echo ">> [PyTorch Technique: $TECHNIQUE] Step 3: Opt-In Mechanistic 2D NIAH Sweep..."
+        uv run --no-sync main.py \
+            --technique "$TECHNIQUE" \
+            --engine pytorch \
+            --model "$MODEL" \
+            --workload niah \
+            --contexts $NIAH_CONTEXTS \
+            --max-tokens 16 \
+            --max-vram-gb 16.0 \
+            --output "results/${TECHNIQUE}_niah_pytorch_16gb.json"
+    fi
+
+    echo "=== PyTorch Benchmark Pipeline for $TECHNIQUE Completed Successfully ==="
     exit 0
 fi
 
@@ -200,6 +295,10 @@ else
 
     if [[ "$RUN_FULL_SWEEP" == "1" ]]; then
         if [[ "$SKIP_HARDWARE_SWEEPS" != "1" ]]; then
+            MACRO_REF=""
+            if [[ -f "results/references/baseline_macro_${ENGINE}_ref.json" ]]; then
+                MACRO_REF="--eval-reference results/references/baseline_macro_${ENGINE}_ref.json"
+            fi
             echo ">> 1. Running Technique Single-Stream Scaling Sweep (${TECHNIQUE}, engine: ${ENGINE}, 512 - 32768, with profiling)..."
             uv run --no-sync main.py \
                 --technique "$TECHNIQUE" \
@@ -208,6 +307,7 @@ else
                 --contexts $CONTEXTS \
                 --max-vram-gb 16.0 \
                 --profile \
+                $MACRO_REF \
                 --output "results/${TECHNIQUE}_hardware${SUFFIX}_16gb.json"
         fi
 
