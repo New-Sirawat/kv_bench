@@ -191,30 +191,6 @@ def _install_vllm_infinigen_hooks() -> None:
     _VLLM_HOOKS_INSTALLED = True
 
 
-def _install_pytorch_infinigen_hooks() -> None:
-    global _PYTORCH_HOOKS_INSTALLED, _ORIG_SDPA
-    if _PYTORCH_HOOKS_INSTALLED:
-        return
-
-    try:
-        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-        from src.techniques.infinigen_cache import get_active_infinigen_cache
-    except ImportError:
-        return
-
-    orig_sdpa = ALL_ATTENTION_FUNCTIONS.get_interface("sdpa", None)
-    if orig_sdpa is None:
-        return
-
-    _ORIG_SDPA = orig_sdpa
-
-    def infinigen_sdpa_attention_forward(module, query, key, value, *args, **kwargs):
-        output, attn_weights = _ORIG_SDPA(module, query, key, value, *args, **kwargs)
-        return output, attn_weights
-
-    ALL_ATTENTION_FUNCTIONS.register("sdpa", infinigen_sdpa_attention_forward)
-    _PYTORCH_HOOKS_INSTALLED = True
-
 
 @register("infinigen")
 class InfiniGenTechnique(Technique):
@@ -283,7 +259,6 @@ class InfiniGenTechnique(Technique):
             }
         )
         _install_vllm_infinigen_hooks()
-        _install_pytorch_infinigen_hooks()
 
     def engine_kwargs(self, context_length: int, max_tokens: int) -> dict[str, Any]:
         del context_length, max_tokens

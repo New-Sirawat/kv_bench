@@ -165,12 +165,13 @@ class InfiniGenLayer(DynamicLayer):
         self.max_budget_ratio = float(max_budget_ratio)
         self.gpu_sink_tokens = int(gpu_sink_tokens)
 
-        # Full Host CPU DRAM cache pool
-        self.cpu_keys: torch.Tensor | None = None
-        self.cpu_values: torch.Tensor | None = None
+        # Full Host CPU DRAM cache pool (pre-allocated pinned buffer)
+        self.cpu_k_buf: torch.Tensor | None = None
+        self.cpu_v_buf: torch.Tensor | None = None
 
-        # GPU Proxy Key slice
-        self.proxy_keys: torch.Tensor | None = None
+        # GPU Proxy Key slice (pre-allocated GPU buffer)
+        self.proxy_k_buf: torch.Tensor | None = None
+        self.capacity: int = 0
 
         self.rotation_matrix: torch.Tensor | None = None
         self.d_proxy: int = 0
@@ -179,6 +180,41 @@ class InfiniGenLayer(DynamicLayer):
         self.total_bytes_transferred_pcie: int = 0
         self.total_prefetched_blocks: int = 0
         self.total_omitted_blocks: int = 0
+
+    @property
+    def cpu_keys(self) -> torch.Tensor | None:
+        if self.total_tokens_seen == 0 or self.cpu_k_buf is None:
+            return None
+        return self.cpu_k_buf[:, :, : self.total_tokens_seen, :]
+
+    @cpu_keys.setter
+    def cpu_keys(self, value: torch.Tensor | None) -> None:
+        if value is None:
+            self.cpu_k_buf = None
+            self.capacity = 0
+
+    @property
+    def cpu_values(self) -> torch.Tensor | None:
+        if self.total_tokens_seen == 0 or self.cpu_v_buf is None:
+            return None
+        return self.cpu_v_buf[:, :, : self.total_tokens_seen, :]
+
+    @cpu_values.setter
+    def cpu_values(self, value: torch.Tensor | None) -> None:
+        if value is None:
+            self.cpu_v_buf = None
+            self.capacity = 0
+
+    @property
+    def proxy_keys(self) -> torch.Tensor | None:
+        if self.total_tokens_seen == 0 or self.proxy_k_buf is None:
+            return None
+        return self.proxy_k_buf[:, :, : self.total_tokens_seen, :]
+
+    @proxy_keys.setter
+    def proxy_keys(self, value: torch.Tensor | None) -> None:
+        if value is None:
+            self.proxy_k_buf = None
 
     @property
     def keys(self) -> torch.Tensor | None:
@@ -211,6 +247,45 @@ class InfiniGenLayer(DynamicLayer):
             self.d_proxy = max(1, int(head_dim * self.k_proxy_ratio))
         return self.rotation_matrix
 
+    def _ensure_capacity(
+        self,
+        batch_size: int,
+        num_kv: int,
+        head_dim: int,
+        target_device: torch.device,
+        target_dtype: torch.dtype,
+        required_capacity: int,
+    ) -> None:
+        if self.capacity >= required_capacity:
+            return
+
+        new_capacity = max(required_capacity, self.capacity * 2, 2048)
+        pin = torch.cuda.is_available()
+
+        new_cpu_k = torch.empty(
+            (batch_size, num_kv, new_capacity, head_dim),
+            dtype=target_dtype,
+            device="cpu",
+            pin_memory=pin,
+        )
+        new_cpu_v = torch.empty_like(new_cpu_k)
+
+        new_proxy_k = torch.empty(
+            (batch_size, num_kv, new_capacity, self.d_proxy),
+            dtype=target_dtype,
+            device=target_device,
+        )
+
+        if self.total_tokens_seen > 0 and self.cpu_k_buf is not None and self.proxy_k_buf is not None:
+            new_cpu_k[:, :, : self.total_tokens_seen, :].copy_(self.cpu_k_buf[:, :, : self.total_tokens_seen, :])
+            new_cpu_v[:, :, : self.total_tokens_seen, :].copy_(self.cpu_v_buf[:, :, : self.total_tokens_seen, :])
+            new_proxy_k[:, :, : self.total_tokens_seen, :].copy_(self.proxy_k_buf[:, :, : self.total_tokens_seen, :])
+
+        self.cpu_k_buf = new_cpu_k
+        self.cpu_v_buf = new_cpu_v
+        self.proxy_k_buf = new_proxy_k
+        self.capacity = new_capacity
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -228,31 +303,29 @@ class InfiniGenLayer(DynamicLayer):
         rot_matrix = self._ensure_rotation_matrix(head_dim, target_device, target_dtype)
 
         new_tokens = key_states.shape[-2]
-        self.total_tokens_seen += new_tokens
+        batch_size = key_states.shape[0]
+        num_kv = key_states.shape[1]
+
+        curr = self.total_tokens_seen
+        self._ensure_capacity(batch_size, num_kv, head_dim, target_device, target_dtype, curr + new_tokens)
 
         # SVD-rotated keys for proxy generation
         k_rotated = torch.matmul(key_states, rot_matrix)
         k_proxy_slice = k_rotated[..., : self.d_proxy]
 
-        # Update GPU Proxy Keys
-        if self.proxy_keys is None:
-            self.proxy_keys = k_proxy_slice
-        else:
-            self.proxy_keys = torch.cat([self.proxy_keys, k_proxy_slice], dim=-2)
+        # In-place write to GPU Proxy Keys (zero GPU allocation)
+        assert self.proxy_k_buf is not None
+        self.proxy_k_buf[:, :, curr : curr + new_tokens, :].copy_(k_proxy_slice)
 
-        # Update full cache in Host CPU DRAM
-        k_cpu = key_states.detach().to("cpu", non_blocking=True)
-        v_cpu = value_states.detach().to("cpu", non_blocking=True)
+        # In-place zero-copy DMA to pinned Host CPU DRAM (zero CPU allocation)
+        assert self.cpu_k_buf is not None and self.cpu_v_buf is not None
+        self.cpu_k_buf[:, :, curr : curr + new_tokens, :].copy_(key_states, non_blocking=True)
+        self.cpu_v_buf[:, :, curr : curr + new_tokens, :].copy_(value_states, non_blocking=True)
 
-        if self.cpu_keys is None:
-            self.cpu_keys = k_cpu
-            self.cpu_values = v_cpu
-        else:
-            self.cpu_keys = torch.cat([self.cpu_keys, k_cpu], dim=-2)
-            self.cpu_values = torch.cat([self.cpu_values, v_cpu], dim=-2)
+        self.total_tokens_seen += new_tokens
 
         # Track initial offload to CPU DRAM
-        bytes_offload = (k_cpu.nelement() + v_cpu.nelement()) * k_cpu.element_size()
+        bytes_offload = (key_states.nelement() + value_states.nelement()) * key_states.element_size()
         self.total_bytes_transferred_pcie += bytes_offload
 
         # Single-token decode step with historical context: run Speculative Prefetching
@@ -261,9 +334,10 @@ class InfiniGenLayer(DynamicLayer):
             q_rot = torch.matmul(key_states, rot_matrix)
             q_proxy = q_rot[..., : self.d_proxy]
 
+            active_proxy = self.proxy_k_buf[:, :, : self.total_tokens_seen, :]
             _, prefetched_blocks, _ = compute_speculative_block_mask(
                 query=q_proxy,
-                proxy_keys=self.proxy_keys,
+                proxy_keys=active_proxy,
                 alpha=self.alpha_threshold,
                 block_size=self.block_size,
                 max_budget_ratio=self.max_budget_ratio,
@@ -283,8 +357,8 @@ class InfiniGenLayer(DynamicLayer):
                 fetch_indices.extend(range(b_start, b_end))
 
             fetch_idx_tensor = torch.tensor(fetch_indices, dtype=torch.long)
-            k_fetched = self.cpu_keys[:, :, fetch_idx_tensor, :].to(target_device, non_blocking=True)
-            v_fetched = self.cpu_values[:, :, fetch_idx_tensor, :].to(target_device, non_blocking=True)
+            k_fetched = self.cpu_k_buf[:, :, fetch_idx_tensor, :].to(target_device, non_blocking=True)
+            v_fetched = self.cpu_v_buf[:, :, fetch_idx_tensor, :].to(target_device, non_blocking=True)
 
             bytes_in = (k_fetched.nelement() + v_fetched.nelement()) * k_fetched.element_size()
             self.total_bytes_transferred_pcie += bytes_in
@@ -296,8 +370,8 @@ class InfiniGenLayer(DynamicLayer):
             return self.gpu_keys, self.gpu_values
 
         # During prefill or small sequences, return full keys from CPU/GPU
-        self.gpu_keys = self.cpu_keys.to(target_device, non_blocking=True)
-        self.gpu_values = self.cpu_values.to(target_device, non_blocking=True)
+        self.gpu_keys = self.cpu_k_buf[:, :, : self.total_tokens_seen, :].to(target_device, non_blocking=True)
+        self.gpu_values = self.cpu_v_buf[:, :, : self.total_tokens_seen, :].to(target_device, non_blocking=True)
         return self.gpu_keys, self.gpu_values
 
     def get_seq_length(self) -> int:
