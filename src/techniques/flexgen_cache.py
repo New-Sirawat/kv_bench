@@ -154,22 +154,79 @@ class FlexGenKVLayer(DynamicLayer):
         self.group_size = int(group_size)
         self.cpu_delegation = bool(cpu_delegation)
 
-        # CPU-resident tier (offloaded tier)
-        # If quantize_kv: tuple of (packed, scales, mins)
-        # Else: torch.Tensor on CPU
-        self.cpu_keys: Any = None
-        self.cpu_values: Any = None
+        # CPU-resident pre-allocated pinned memory storage
+        self.num_cpu_tokens: int = 0
+        self.cpu_capacity: int = 0
+
+        self.cpu_k_packed: torch.Tensor | None = None
+        self.cpu_k_scales: torch.Tensor | None = None
+        self.cpu_k_mins: torch.Tensor | None = None
+
+        self.cpu_v_packed: torch.Tensor | None = None
+        self.cpu_v_scales: torch.Tensor | None = None
+        self.cpu_v_mins: torch.Tensor | None = None
+
+        self.cpu_k_raw: torch.Tensor | None = None
+        self.cpu_v_raw: torch.Tensor | None = None
 
         self.total_tokens_seen: int = 0
         self.total_bytes_transferred_pcie: int = 0
         self.num_offload_events: int = 0
 
     @property
+    def cpu_keys(self) -> Any:
+        if self.num_cpu_tokens == 0:
+            return None
+        if self.quantize_kv:
+            assert self.cpu_k_packed is not None and self.cpu_k_scales is not None and self.cpu_k_mins is not None
+            return (
+                self.cpu_k_packed[:, :, : self.num_cpu_tokens],
+                self.cpu_k_scales[:, :, : self.num_cpu_tokens],
+                self.cpu_k_mins[:, :, : self.num_cpu_tokens],
+            )
+        assert self.cpu_k_raw is not None
+        return self.cpu_k_raw[:, :, : self.num_cpu_tokens]
+
+    @cpu_keys.setter
+    def cpu_keys(self, value: Any) -> None:
+        if value is None:
+            self.num_cpu_tokens = 0
+            self.cpu_k_packed = None
+            self.cpu_k_scales = None
+            self.cpu_k_mins = None
+            self.cpu_k_raw = None
+            self.cpu_capacity = 0
+
+    @property
+    def cpu_values(self) -> Any:
+        if self.num_cpu_tokens == 0:
+            return None
+        if self.quantize_kv:
+            assert self.cpu_v_packed is not None and self.cpu_v_scales is not None and self.cpu_v_mins is not None
+            return (
+                self.cpu_v_packed[:, :, : self.num_cpu_tokens],
+                self.cpu_v_scales[:, :, : self.num_cpu_tokens],
+                self.cpu_v_mins[:, :, : self.num_cpu_tokens],
+            )
+        assert self.cpu_v_raw is not None
+        return self.cpu_v_raw[:, :, : self.num_cpu_tokens]
+
+    @cpu_values.setter
+    def cpu_values(self, value: Any) -> None:
+        if value is None:
+            self.num_cpu_tokens = 0
+            self.cpu_v_packed = None
+            self.cpu_v_scales = None
+            self.cpu_v_mins = None
+            self.cpu_v_raw = None
+            self.cpu_capacity = 0
+
+    @property
     def keys(self) -> torch.Tensor | None:
         """Return full reconstructed keys tensor across both CPU and GPU tiers."""
         if not self.is_initialized:
             return None
-        return self._reconstruct_full_tensor(self.gpu_keys, self.cpu_keys)
+        return self._reconstruct_full_tensor(self.gpu_keys, is_key=True)
 
     @keys.setter
     def keys(self, value: torch.Tensor | None) -> None:
@@ -180,29 +237,111 @@ class FlexGenKVLayer(DynamicLayer):
         """Return full reconstructed values tensor across both CPU and GPU tiers."""
         if not self.is_initialized:
             return None
-        return self._reconstruct_full_tensor(self.gpu_values, self.cpu_values)
+        return self._reconstruct_full_tensor(self.gpu_values, is_key=False)
 
     @values.setter
     def values(self, value: torch.Tensor | None) -> None:
         self.gpu_values = value
 
-    def _reconstruct_full_tensor(self, gpu_tensor: torch.Tensor | None, cpu_storage: Any) -> torch.Tensor:
+    def _ensure_cpu_capacity(
+        self,
+        batch_size: int,
+        num_kv: int,
+        head_dim: int,
+        target_dtype: torch.dtype,
+        required_capacity: int,
+    ) -> None:
+        if self.cpu_capacity >= required_capacity:
+            return
+
+        new_capacity = max(required_capacity, self.cpu_capacity * 2, 2048)
+        num_groups = head_dim // self.group_size
+        half_g = self.group_size // 2
+        pin = torch.cuda.is_available()
+
+        if self.quantize_kv:
+            new_k_p = torch.empty(
+                (batch_size, num_kv, new_capacity, num_groups, half_g),
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=pin,
+            )
+            new_k_s = torch.empty(
+                (batch_size, num_kv, new_capacity, num_groups, 1),
+                dtype=target_dtype,
+                device="cpu",
+                pin_memory=pin,
+            )
+            new_k_m = torch.empty(
+                (batch_size, num_kv, new_capacity, num_groups, 1),
+                dtype=target_dtype,
+                device="cpu",
+                pin_memory=pin,
+            )
+
+            new_v_p = torch.empty_like(new_k_p)
+            new_v_s = torch.empty_like(new_k_s)
+            new_v_m = torch.empty_like(new_k_m)
+
+            if self.num_cpu_tokens > 0 and self.cpu_k_packed is not None:
+                new_k_p[:, :, : self.num_cpu_tokens].copy_(self.cpu_k_packed[:, :, : self.num_cpu_tokens])
+                new_k_s[:, :, : self.num_cpu_tokens].copy_(self.cpu_k_scales[:, :, : self.num_cpu_tokens])
+                new_k_m[:, :, : self.num_cpu_tokens].copy_(self.cpu_k_mins[:, :, : self.num_cpu_tokens])
+
+                new_v_p[:, :, : self.num_cpu_tokens].copy_(self.cpu_v_packed[:, :, : self.num_cpu_tokens])
+                new_v_s[:, :, : self.num_cpu_tokens].copy_(self.cpu_v_scales[:, :, : self.num_cpu_tokens])
+                new_v_m[:, :, : self.num_cpu_tokens].copy_(self.cpu_v_mins[:, :, : self.num_cpu_tokens])
+
+            self.cpu_k_packed = new_k_p
+            self.cpu_k_scales = new_k_s
+            self.cpu_k_mins = new_k_m
+            self.cpu_v_packed = new_v_p
+            self.cpu_v_scales = new_v_s
+            self.cpu_v_mins = new_v_m
+        else:
+            new_k = torch.empty(
+                (batch_size, num_kv, new_capacity, head_dim),
+                dtype=target_dtype,
+                device="cpu",
+                pin_memory=pin,
+            )
+            new_v = torch.empty_like(new_k)
+            if self.num_cpu_tokens > 0 and self.cpu_k_raw is not None:
+                new_k[:, :, : self.num_cpu_tokens].copy_(self.cpu_k_raw[:, :, : self.num_cpu_tokens])
+                new_v[:, :, : self.num_cpu_tokens].copy_(self.cpu_v_raw[:, :, : self.num_cpu_tokens])
+            self.cpu_k_raw = new_k
+            self.cpu_v_raw = new_v
+
+        self.cpu_capacity = new_capacity
+
+    def _reconstruct_full_tensor(
+        self, gpu_tensor: torch.Tensor | None, is_key: bool = True
+    ) -> torch.Tensor:
         """Reconstruct contiguous tensor from offloaded CPU tier + active GPU tier."""
-        if cpu_storage is None:
+        if self.num_cpu_tokens == 0:
             return gpu_tensor if gpu_tensor is not None else torch.empty(0)
 
         target_device = gpu_tensor.device if gpu_tensor is not None else torch.device("cpu")
         target_dtype = gpu_tensor.dtype if gpu_tensor is not None else torch.float32
 
         if self.quantize_kv:
-            packed, scales, mins = cpu_storage
-            cpu_recon = dequantize_4bit_group(
-                packed, scales, mins, orig_dtype=target_dtype, group_size=self.group_size
+            packed_src = self.cpu_k_packed if is_key else self.cpu_v_packed
+            scales_src = self.cpu_k_scales if is_key else self.cpu_v_scales
+            mins_src = self.cpu_k_mins if is_key else self.cpu_v_mins
+
+            assert packed_src is not None and scales_src is not None and mins_src is not None
+            p_slice = packed_src[:, :, : self.num_cpu_tokens].to(target_device, non_blocking=True)
+            s_slice = scales_src[:, :, : self.num_cpu_tokens].to(target_device, non_blocking=True)
+            m_slice = mins_src[:, :, : self.num_cpu_tokens].to(target_device, non_blocking=True)
+
+            streamed = dequantize_4bit_group(
+                p_slice, s_slice, m_slice, orig_dtype=target_dtype, group_size=self.group_size
             )
         else:
-            cpu_recon = cpu_storage.to(target_dtype)
+            raw_src = self.cpu_k_raw if is_key else self.cpu_v_raw
+            assert raw_src is not None
+            streamed = raw_src[:, :, : self.num_cpu_tokens].to(target_device, non_blocking=True)
 
-        streamed = cpu_recon.to(target_device, non_blocking=True)
         if gpu_tensor is None or gpu_tensor.shape[-2] == 0:
             return streamed
         return torch.cat([streamed, gpu_tensor], dim=-2)
@@ -226,13 +365,30 @@ class FlexGenKVLayer(DynamicLayer):
         self.gpu_keys = self.gpu_keys[..., num_to_offload:, :].contiguous()
         self.gpu_values = self.gpu_values[..., num_to_offload:, :].contiguous()
 
-        # Detach and move to CPU host DRAM
-        k_cpu = k_offload.detach().to("cpu", non_blocking=True)
-        v_cpu = v_offload.detach().to("cpu", non_blocking=True)
+        batch_size = k_offload.shape[0]
+        num_kv = k_offload.shape[1]
+        head_dim = k_offload.shape[-1]
+        target_dtype = k_offload.dtype
 
+        self._ensure_cpu_capacity(
+            batch_size, num_kv, head_dim, target_dtype, self.num_cpu_tokens + num_to_offload
+        )
+
+        curr = self.num_cpu_tokens
         if self.quantize_kv:
-            k_p, k_s, k_m = quantize_4bit_group(k_cpu, group_size=self.group_size)
-            v_p, v_s, v_m = quantize_4bit_group(v_cpu, group_size=self.group_size)
+            k_p, k_s, k_m = quantize_4bit_group(k_offload, group_size=self.group_size)
+            v_p, v_s, v_m = quantize_4bit_group(v_offload, group_size=self.group_size)
+
+            assert self.cpu_k_packed is not None and self.cpu_k_scales is not None and self.cpu_k_mins is not None
+            assert self.cpu_v_packed is not None and self.cpu_v_scales is not None and self.cpu_v_mins is not None
+
+            self.cpu_k_packed[:, :, curr : curr + num_to_offload].copy_(k_p, non_blocking=True)
+            self.cpu_k_scales[:, :, curr : curr + num_to_offload].copy_(k_s, non_blocking=True)
+            self.cpu_k_mins[:, :, curr : curr + num_to_offload].copy_(k_m, non_blocking=True)
+
+            self.cpu_v_packed[:, :, curr : curr + num_to_offload].copy_(v_p, non_blocking=True)
+            self.cpu_v_scales[:, :, curr : curr + num_to_offload].copy_(v_s, non_blocking=True)
+            self.cpu_v_mins[:, :, curr : curr + num_to_offload].copy_(v_m, non_blocking=True)
 
             bytes_out = (
                 k_p.nelement() * k_p.element_size()
@@ -242,31 +398,13 @@ class FlexGenKVLayer(DynamicLayer):
                 + v_s.nelement() * v_s.element_size()
                 + v_m.nelement() * v_m.element_size()
             )
-
-            # Sequence dimension for packed is -3: [batch, heads, seq_len, num_groups, g // 2]
-            if self.cpu_keys is None:
-                self.cpu_keys = (k_p, k_s, k_m)
-                self.cpu_values = (v_p, v_s, v_m)
-            else:
-                self.cpu_keys = (
-                    torch.cat([self.cpu_keys[0], k_p], dim=-3),
-                    torch.cat([self.cpu_keys[1], k_s], dim=-3),
-                    torch.cat([self.cpu_keys[2], k_m], dim=-3),
-                )
-                self.cpu_values = (
-                    torch.cat([self.cpu_values[0], v_p], dim=-3),
-                    torch.cat([self.cpu_values[1], v_s], dim=-3),
-                    torch.cat([self.cpu_values[2], v_m], dim=-3),
-                )
         else:
-            bytes_out = (k_cpu.nelement() + v_cpu.nelement()) * k_cpu.element_size()
-            if self.cpu_keys is None:
-                self.cpu_keys = k_cpu
-                self.cpu_values = v_cpu
-            else:
-                self.cpu_keys = torch.cat([self.cpu_keys, k_cpu], dim=-2)
-                self.cpu_values = torch.cat([self.cpu_values, v_cpu], dim=-2)
+            assert self.cpu_k_raw is not None and self.cpu_v_raw is not None
+            self.cpu_k_raw[:, :, curr : curr + num_to_offload].copy_(k_offload, non_blocking=True)
+            self.cpu_v_raw[:, :, curr : curr + num_to_offload].copy_(v_offload, non_blocking=True)
+            bytes_out = (k_offload.nelement() + v_offload.nelement()) * k_offload.element_size()
 
+        self.num_cpu_tokens += num_to_offload
         self.total_bytes_transferred_pcie += bytes_out
         self.num_offload_events += 1
 

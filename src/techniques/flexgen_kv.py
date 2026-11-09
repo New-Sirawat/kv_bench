@@ -196,39 +196,6 @@ def _install_vllm_flexgen_hooks() -> None:
     _VLLM_HOOKS_INSTALLED = True
 
 
-def _install_pytorch_flexgen_hooks() -> None:
-    """Install PyTorch SDPA hook to track CPU delegation and PCIe telemetry."""
-    global _PYTORCH_HOOKS_INSTALLED, _ORIG_SDPA
-    if _PYTORCH_HOOKS_INSTALLED:
-        return
-
-    try:
-        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-        from src.techniques.flexgen_cache import get_active_flexgen_cache
-    except ImportError:
-        return
-
-    orig_sdpa = ALL_ATTENTION_FUNCTIONS.get_interface("sdpa", None)
-    if orig_sdpa is None:
-        return
-
-    _ORIG_SDPA = orig_sdpa
-
-    def flexgen_sdpa_attention_forward(module, query, key, value, *args, **kwargs):
-        output, attn_weights = _ORIG_SDPA(module, query, key, value, *args, **kwargs)
-        cache = get_active_flexgen_cache()
-        if cache is not None and getattr(cache, "is_flexgen", False):
-            layer_idx = getattr(module, "layer_idx", None)
-            if layer_idx is not None and layer_idx < len(cache.layers):
-                layer = cache.layers[layer_idx]
-                if query.shape[-2] == 1 and hasattr(layer, "prune"):
-                    layer.prune()
-
-        return output, attn_weights
-
-    ALL_ATTENTION_FUNCTIONS.register("sdpa", flexgen_sdpa_attention_forward)
-    _PYTORCH_HOOKS_INSTALLED = True
-
 
 @register("flexgen_kv")
 class FlexGenKVTechnique(Technique):
@@ -306,7 +273,6 @@ class FlexGenKVTechnique(Technique):
             }
         )
         _install_vllm_flexgen_hooks()
-        _install_pytorch_flexgen_hooks()
 
     def engine_kwargs(self, context_length: int, max_tokens: int) -> dict[str, Any]:
         """Return engine kwargs configuring swap space and KV cache quantization."""
