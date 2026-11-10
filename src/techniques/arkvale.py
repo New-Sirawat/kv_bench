@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Any
 
 try:
@@ -43,17 +42,15 @@ def compute_page_aabb_digests(
     head_dim = k_pages.size(-1)
     num_pages = math.ceil(seq_len / page_size)
 
-    # Pad seq_len to a multiple of page_size if necessary
     pad_len = num_pages * page_size - seq_len
     if pad_len > 0:
         k_padded = F.pad(k_pages, (0, 0, 0, pad_len))
     else:
         k_padded = k_pages
 
-    # Reshape: (batch, heads, num_pages, page_size, head_dim)
-    pages = k_padded.view(*k_pages.shape[:-2], num_pages, page_size, head_dim)
+    pages = k_padded.contiguous().reshape(*k_pages.shape[:-2], num_pages, page_size, head_dim)
 
-    c = 0.5 * (pages.amin(dim=-2) + pages.amax(dim=-2))  # (..., num_pages, head_dim)
+    c = 0.5 * (pages.amin(dim=-2) + pages.amax(dim=-2))
     r_mean = (pages - c.unsqueeze(-2)).abs().mean(dim=-2)
 
     b_max = c + r_mean
@@ -84,7 +81,6 @@ def score_page_digests_gqa(
     num_kv_heads = b_min.size(1)
     num_pages = b_min.size(2)
 
-    # Expand digests across GQA query groups: (batch, num_q_heads, num_pages, d)
     if gqa_ratio > 1:
         expanded_b_min = b_min.repeat_interleave(gqa_ratio, dim=1)
         expanded_b_max = b_max.repeat_interleave(gqa_ratio, dim=1)
@@ -92,19 +88,16 @@ def score_page_digests_gqa(
         expanded_b_min = b_min
         expanded_b_max = b_max
 
-    # q: (batch, num_q_heads, 1, d) -> unsqueeze to match pages: (batch, num_q_heads, 1, 1, d)
-    q_expanded = query.unsqueeze(-2)  # (batch, num_q_heads, 1, 1, d)
+    q_expanded = query.unsqueeze(-2)
 
     prod_min = q_expanded * expanded_b_min.unsqueeze(-3)
     prod_max = q_expanded * expanded_b_max.unsqueeze(-3)
 
-    # Coordinate-wise maximum summed over dimension d
     page_scores = torch.maximum(prod_min, prod_max).sum(dim=-1) / math.sqrt(d)
-    page_scores = page_scores.squeeze(-2)  # (batch, num_q_heads, num_pages)
+    page_scores = page_scores.squeeze(-2)
 
-    # Max-pool across GQA group for the KV head
     if gqa_ratio > 1:
-        kv_scores = page_scores.view(batch, num_kv_heads, gqa_ratio, num_pages).max(dim=2).values
+        kv_scores = page_scores.contiguous().reshape(batch, num_kv_heads, gqa_ratio, num_pages).max(dim=2).values
     else:
         kv_scores = page_scores
 
@@ -125,10 +118,8 @@ def select_and_recall_pages(
     num_pages = kv_scores.size(-1)
     k_pages = min(active_pages_budget, num_pages)
 
-    # Aggregate scores across batch and KV heads to select globally active physical pages
-    agg_scores = kv_scores.mean(dim=(0, 1))  # (num_pages,)
+    agg_scores = kv_scores.mean(dim=(0, 1))
 
-    # Reserve page 0
     k_top = max(1, k_pages - 1)
     _, top_pages = torch.topk(agg_scores, k=min(k_top, num_pages))
     active_pages = torch.unique(torch.cat([torch.tensor([0], device=top_pages.device), top_pages]))
@@ -165,16 +156,10 @@ def compute_gqa_arkvale_attention(
     seq_len_kv = key.size(2)
     gqa_ratio = num_q_heads // num_kv_heads
 
-    # 1. Compute AABB digests from Key pages
     b_min, b_max, num_pages = compute_page_aabb_digests(key, page_size=page_size)
-
-    # 2. Score digests using upper-bound dot product
     kv_scores = score_page_digests_gqa(query, b_min, b_max, gqa_ratio=gqa_ratio)
-
-    # 3. Dynamic page ranking and recall selection
     active_pages, telemetry = select_and_recall_pages(kv_scores, active_pages_budget=active_pages_budget)
 
-    # 4. Gather active page tokens
     token_indices = []
     for p in active_pages.tolist():
         start = p * page_size
@@ -186,7 +171,6 @@ def compute_gqa_arkvale_attention(
     k_active = key[:, :, token_idx_tensor, :]
     v_active = value[:, :, token_idx_tensor, :]
 
-    # 5. GQA expansion
     if gqa_ratio > 1:
         expanded_k = k_active.repeat_interleave(gqa_ratio, dim=1)
         expanded_v = v_active.repeat_interleave(gqa_ratio, dim=1)
@@ -260,14 +244,31 @@ class ArkValeTechnique(Technique):
     def workload(self) -> Workload:
         return SyntheticFiller()
 
+    def pytorch_cache_factory(self) -> Any:
+        from src.techniques.arkvale_cache import ArkValeCache
+
+        return lambda: ArkValeCache(
+            page_size=self.page_size,
+            active_pages_budget=self.active_pages_budget,
+            exempt_early_layers=self.exempt_early_layers,
+        )
+
     def extra_metrics(self, llm, workload_output) -> dict[str, Any]:
         del llm, workload_output
+        from src.techniques.arkvale_cache import get_active_arkvale_cache
+
+        active_cache = get_active_arkvale_cache()
+        pcie_bytes = active_cache.total_bytes_transferred_pcie if active_cache is not None else 0
+        recalled_pages = active_cache.total_recalled_pages if active_cache is not None else 0
+
         return {
             "page_size": self.page_size,
             "active_pages_budget": self.active_pages_budget,
             "exempt_early_layers": self.exempt_early_layers,
             "compression_ratio_vs_bf16": self.compression_ratio,
             "block_size": self.block_size,
+            "pcie_transfer_bytes": pcie_bytes,
+            "recalled_pages": recalled_pages,
             "aabb_digests_active": True,
             "page_recall_supported": True,
         }
