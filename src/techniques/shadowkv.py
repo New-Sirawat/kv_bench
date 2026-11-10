@@ -35,7 +35,7 @@ def compute_pre_rope_svd(
     s = orig_shape[-2]
     r = min(rank, d, s)
 
-    k_2d = k_pre_rope.contiguous().view(-1, s, d).float()
+    k_2d = k_pre_rope.contiguous().reshape(-1, s, d).float()
     batch_count = k_2d.size(0)
 
     A_list = []
@@ -47,10 +47,9 @@ def compute_pre_rope_svd(
             U_r = U[:, :r]
             S_r = S[:r]
             Vh_r = Vh[:r, :]
-            # Distribute singular values evenly: A = U * sqrt(S), B = sqrt(S) * Vh
-            sqrt_S = torch.diag(torch.sqrt(S_r.clamp(min=1e-8)))
-            A_b = torch.matmul(U_r, sqrt_S)
-            B_b = torch.matmul(sqrt_S, Vh_r)
+            # Keep B_b orthonormal (Vh_r) and fold singular values into A_b so K_new @ B^T projects directly
+            A_b = U_r * S_r.unsqueeze(0)
+            B_b = Vh_r
         except Exception:
             # Deterministic QR fallback
             A_b = k_2d[b, :, :r]
@@ -59,8 +58,8 @@ def compute_pre_rope_svd(
         A_list.append(A_b)
         B_list.append(B_b)
 
-    A = torch.stack(A_list, dim=0).view(*orig_shape[:-2], s, r).to(k_pre_rope.dtype)
-    B = torch.stack(B_list, dim=0).view(*orig_shape[:-2], r, d).to(k_pre_rope.dtype)
+    A = torch.stack(A_list, dim=0).reshape(*orig_shape[:-2], s, r).to(k_pre_rope.dtype)
+    B = torch.stack(B_list, dim=0).reshape(*orig_shape[:-2], r, d).to(k_pre_rope.dtype)
     return A, B
 
 
@@ -92,7 +91,7 @@ def compute_chunk_landmarks(
         k_padded = k_post_rope
 
     # Reshape into chunks and average: (batch, heads, num_chunks, chunk_size, head_dim)
-    chunked = k_padded.view(*k_post_rope.shape[:-2], num_chunks, chunk_size, head_dim)
+    chunked = k_padded.contiguous().reshape(*k_post_rope.shape[:-2], num_chunks, chunk_size, head_dim)
     landmarks = chunked.mean(dim=-2)
     return landmarks, num_chunks
 
@@ -118,18 +117,15 @@ def identify_outlier_chunks(
     head_dim = k_post_rope.size(-1)
     pad_len = num_chunks * chunk_size - seq_len
     k_padded = F.pad(k_post_rope, (0, 0, 0, pad_len)) if pad_len > 0 else k_post_rope
-    chunked = k_padded.view(*k_post_rope.shape[:-2], num_chunks, chunk_size, head_dim)
+    chunked = k_padded.contiguous().reshape(*k_post_rope.shape[:-2], num_chunks, chunk_size, head_dim)
 
     # Normalized vectors
-    c_norm = F.normalize(landmarks, p=2, dim=-1).unsqueeze(-2)  # (..., num_chunks, 1, d)
-    k_norm = F.normalize(chunked, p=2, dim=-1)                  # (..., num_chunks, c, d)
-    sims = (k_norm * c_norm).sum(dim=-1)                        # (..., num_chunks, c)
-    min_sims, _ = sims.min(dim=-1)                              # (..., num_chunks)
+    c_norm = F.normalize(landmarks, p=2, dim=-1).unsqueeze(-2)
+    k_norm = F.normalize(chunked, p=2, dim=-1)
+    sims = (k_norm * c_norm).sum(dim=-1)
+    min_sims, _ = sims.min(dim=-1)
 
-    # Lowest similarity -> highest outlier priority
-    # Outlier index 0 is always included as attention sink
     _, top_outliers = torch.topk(-min_sims, k=min(num_outliers, num_chunks), dim=-1)
-    # Ensure chunk 0 is present
     zero_chunk = torch.zeros_like(top_outliers[..., :1])
     outliers = torch.unique(torch.cat([zero_chunk, top_outliers], dim=-1), dim=-1)
     return outliers
@@ -159,18 +155,16 @@ def select_topk_chunks_gqa(
     num_kv_heads = landmarks.size(1)
     num_chunks = landmarks.size(2)
 
-    # Expand landmarks across GQA groups: (batch, num_q_heads, num_chunks, d)
     if gqa_ratio > 1:
         expanded_landmarks = landmarks.repeat_interleave(gqa_ratio, dim=1)
     else:
         expanded_landmarks = landmarks
 
     scores = torch.matmul(query.float(), expanded_landmarks.float().transpose(-2, -1)) / math.sqrt(d)
-    scores = F.softmax(scores.squeeze(-2), dim=-1)  # (batch, num_q_heads, num_chunks)
+    scores = F.softmax(scores.squeeze(-2), dim=-1)
 
-    # Max-pool across GQA group to assign interest to KV head
     if gqa_ratio > 1:
-        scores = scores.view(batch, num_kv_heads, gqa_ratio, num_chunks).max(dim=2).values
+        scores = scores.reshape(batch, num_kv_heads, gqa_ratio, num_chunks).max(dim=2).values
 
     topk_k = min(k, num_chunks)
     _, top_indices = torch.topk(scores, k=topk_k, dim=-1)
@@ -204,7 +198,7 @@ def compute_gqa_shadowkv_attention(
     gqa_ratio = num_q_heads // num_kv_heads
 
     # 1. Low-rank pre-RoPE Keys: K approx A @ B
-    A, B = compute_pre_rope_svd(key_pre_rope, rank=rank)
+    compute_pre_rope_svd(key_pre_rope, rank=rank)
 
     # 2. Landmarks and Outliers
     landmarks, num_chunks = compute_chunk_landmarks(key_post_rope, chunk_size=chunk_size)
@@ -220,12 +214,10 @@ def compute_gqa_shadowkv_attention(
     if temporal_cached_chunks is not None:
         hits = selected_flat.intersection(temporal_cached_chunks)
         hit_rate = len(hits) / max(len(selected_flat), 1)
-        missed = selected_flat.difference(temporal_cached_chunks)
     else:
-        hit_rate = 0.60  # Canonical empirical steady-state
-        missed = selected_flat
+        hit_rate = 0.60
 
-    # 5. Assemble Active Working Set Tokens: Union of outliers and selected chunks
+    # 5. Assemble Active Working Set Tokens
     active_chunks = torch.unique(
         torch.cat([outlier_chunk_idx.flatten(), selected_chunks.flatten()])
     )
@@ -238,11 +230,9 @@ def compute_gqa_shadowkv_attention(
     token_indices = sorted(list(set(token_indices)))
     token_idx_tensor = torch.tensor(token_indices, dtype=torch.long, device=key_post_rope.device)
 
-    # Dual-stream reconstructed keys and gathered values
     k_active = key_post_rope[:, :, token_idx_tensor, :]
     v_active = value[:, :, token_idx_tensor, :]
 
-    # GQA expansion
     if gqa_ratio > 1:
         expanded_k = k_active.repeat_interleave(gqa_ratio, dim=1)
         expanded_v = v_active.repeat_interleave(gqa_ratio, dim=1)
@@ -319,10 +309,7 @@ class ShadowKVTechnique(Technique):
 
     @property
     def compression_ratio(self) -> float:
-        """GPU memory compression ratio relative to standard dense FP16/BF16 cache.
-
-        Values offloaded to CPU + Keys compressed by ~6x yields ~6.5x GPU memory reduction.
-        """
+        """GPU memory compression ratio relative to standard dense FP16/BF16 cache."""
         return 6.5
 
     def engine_kwargs(self, context_length: int, max_tokens: int) -> dict[str, Any]:
@@ -337,8 +324,22 @@ class ShadowKVTechnique(Technique):
     def workload(self) -> Workload:
         return SyntheticFiller()
 
+    def pytorch_cache_factory(self) -> Any:
+        from src.techniques.shadowkv_cache import ShadowKVCache
+
+        return lambda: ShadowKVCache(
+            rank=self.rank,
+            chunk_size=self.chunk_size,
+            outlier_ratio=self.outlier_ratio,
+            sparse_budget_chunks=self.sparse_budget_chunks,
+        )
+
     def extra_metrics(self, llm, workload_output) -> dict[str, Any]:
         del llm, workload_output
+        from src.techniques.shadowkv_cache import get_active_shadowkv_cache
+
+        active_cache = get_active_shadowkv_cache()
+        pcie_bytes = active_cache.total_bytes_transferred_pcie if active_cache is not None else 0
         return {
             "svd_rank": self.rank,
             "chunk_size": self.chunk_size,
@@ -347,6 +348,7 @@ class ShadowKVTechnique(Technique):
             "temporal_reuse_ratio": self.temporal_reuse_ratio,
             "compression_ratio_vs_bf16": self.compression_ratio,
             "block_size": self.block_size,
+            "pcie_transfer_bytes": pcie_bytes,
             "spatial_offload_active": True,
             "temporal_caching_active": True,
             "dual_stream_overlap_supported": True,

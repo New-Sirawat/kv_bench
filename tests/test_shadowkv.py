@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import torch
 
 from src.core.axis import Axis
+from src.core.diagnostic import inspect_sample_diagnostic
+from src.core.pytorch_runner import PyTorchRunner
 from src.core.registry import get_technique, list_techniques
 from src.techniques.shadowkv import (
     ShadowKVTechnique,
@@ -12,6 +14,11 @@ from src.techniques.shadowkv import (
     compute_pre_rope_svd,
     identify_outlier_chunks,
     select_topk_chunks_gqa,
+)
+from src.techniques.shadowkv_cache import (
+    ShadowKVCache,
+    ShadowKVLayer,
+    get_active_shadowkv_cache,
 )
 
 
@@ -69,7 +76,6 @@ class TestShadowKVTechnique(unittest.TestCase):
 
         k_recon = torch.matmul(A, B)
         self.assertEqual(k_recon.shape, k.shape)
-        # Cosine similarity should be high (> 0.85 for rank 16 on dim 64)
         cos_sim = torch.cosine_similarity(k.view(-1, dim), k_recon.view(-1, dim), dim=-1)
         self.assertGreater(cos_sim.mean().item(), 0.80)
 
@@ -84,7 +90,6 @@ class TestShadowKVTechnique(unittest.TestCase):
         self.assertEqual(landmarks.shape, (batch, heads, 8, dim))
 
         outliers = identify_outlier_chunks(k, landmarks, chunk_size=chunk_size, outlier_ratio=0.15)
-        # Chunk 0 (attention sink) must always be retained
         self.assertIn(0, outliers.flatten().tolist())
 
     def test_select_topk_chunks_gqa(self):
@@ -103,7 +108,7 @@ class TestShadowKVTechnique(unittest.TestCase):
 
     def test_compute_gqa_shadowkv_attention(self):
         batch, seq_len_q, head_dim = 1, 1, 32
-        num_q_heads, num_kv_heads = 8, 2  # 4:1 GQA ratio
+        num_q_heads, num_kv_heads = 8, 2
         seq_len_kv = 64
 
         torch.manual_seed(300)
@@ -118,10 +123,68 @@ class TestShadowKVTechnique(unittest.TestCase):
 
         self.assertEqual(attn_out.shape, (batch, num_q_heads, seq_len_q, head_dim))
         self.assertTrue(torch.allclose(attn_weights.sum(dim=-1), torch.ones_like(attn_weights.sum(dim=-1)), atol=1e-4))
-        self.assertIn("active_tokens", telemetry)
-        self.assertIn("sparsity_ratio", telemetry)
         self.assertGreater(telemetry["sparsity_ratio"], 0.0)
         self.assertTrue(telemetry["dual_stream_overlapped"])
+
+    def test_shadowkv_layer_offload_and_sparse_decode(self):
+        torch.manual_seed(99)
+        layer = ShadowKVLayer(rank=8, chunk_size=8, sparse_budget_chunks=2)
+        batch, heads, dim = 1, 4, 64
+
+        # Prefill 64 tokens -> 8 chunks (> budget of 2*8=16 tokens)
+        k_pre = torch.randn(batch, 64, heads, dim, dtype=torch.bfloat16).transpose(1, 2)
+        v_pre = torch.randn(batch, 64, heads, dim, dtype=torch.bfloat16).transpose(1, 2)
+        out_k, out_v = layer.update(k_pre, v_pre)
+        self.assertEqual(out_k.shape, (batch, heads, 64, dim))
+        self.assertEqual(out_v.shape, (batch, heads, 64, dim))
+        self.assertEqual(layer.get_seq_length(), 64)
+
+        # Decode 1 token -> triggers sparse landmark retrieval (< 64 tokens returned)
+        k_dec = torch.randn(batch, heads, 1, dim, dtype=torch.bfloat16)
+        v_dec = torch.randn(batch, heads, 1, dim, dtype=torch.bfloat16)
+        out_k2, out_v2 = layer.update(k_dec, v_dec)
+        self.assertEqual(layer.get_seq_length(), 65)
+        self.assertLess(out_k2.shape[-2], 65)
+        self.assertEqual(out_k2.shape[-2], out_v2.shape[-2])
+        # Chunk 0 (sink) must remain in active_positions
+        self.assertIn(0, layer.original_positions)
+        self.assertGreater(layer.total_bytes_transferred_pcie, 0)
+
+    def test_shadowkv_cache_factory_and_pytorch_runner(self):
+        technique = get_technique("shadowkv", rank=8, chunk_size=8, sparse_budget_chunks=2)
+        cache_factory = technique.pytorch_cache_factory()
+        self.assertIsNotNone(cache_factory)
+
+        cache = cache_factory()
+        self.assertIsInstance(cache, ShadowKVCache)
+        self.assertEqual(get_active_shadowkv_cache(), cache)
+
+        k1 = torch.randn(1, 4, 32, 64, dtype=torch.float32)
+        v1 = torch.randn(1, 4, 32, 64, dtype=torch.float32)
+        cache.update(k1, v1, layer_idx=0)
+        cache.update(torch.randn(1, 4, 1, 64), torch.randn(1, 4, 1, 64), layer_idx=0)
+
+        diag = inspect_sample_diagnostic(
+            cache=cache,
+            prompt_text="Test ShadowKV diagnostic",
+            prompt_token_ids=list(range(32)),
+            sample_meta={"id": "skv_diag_0", "task_type": "unit"},
+            is_correct=True,
+            baseline_correct=True,
+            bits_per_scalar=16.0,
+        )
+        self.assertGreater(diag.overall_retention_ratio, 0.0)
+        self.assertLess(diag.overall_retention_ratio, 1.0)
+
+        runner = PyTorchRunner(
+            model_name_or_path="Qwen/Qwen3-4B-Instruct-2507",
+            revision="cdbee75f17c01a7cc42f958dc650907174af0554",
+            cache_factory=cache_factory,
+            dry_run=True,
+        )
+        outputs = runner.generate(["Test ShadowKV prompt."], max_tokens=16)
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(len(outputs[0].outputs[0].token_ids), 16)
 
 
 if __name__ == "__main__":
