@@ -36,7 +36,7 @@ def set_active_shadowkv_cache(cache: ShadowKVCache | None) -> None:
 
 
 class ShadowKVLayer(DynamicLayer):
-    """Cache layer implementing ShadowKV low-rank GPU Keys, chunk landmarks, and CPU Value offload."""
+    """Cache layer implementing ShadowKV low-rank GPU Keys, incremental chunk landmarks, and CPU Value offload."""
 
     is_sliding = False
 
@@ -56,15 +56,17 @@ class ShadowKVLayer(DynamicLayer):
         self.sparse_budget_chunks = int(sparse_budget_chunks)
 
         self.capacity: int = 0
+        self.chunk_capacity: int = 0
         self.total_tokens_seen: int = 0
         self.head_dim: int = 0
         self.effective_rank: int = 0
         self.target_dtype: Any = None
         self.target_device: Any = None
 
-        # GPU-resident compressed Key subspace: K approx A @ B
+        # GPU-resident compressed Key subspace: K approx A @ B, plus incremental chunk landmarks
         self.gpu_k_A: torch.Tensor | None = None
         self.gpu_k_B: torch.Tensor | None = None
+        self.gpu_landmarks: torch.Tensor | None = None
 
         # CPU pinned host DRAM Value pool
         self.cpu_v_buf: torch.Tensor | None = None
@@ -131,21 +133,59 @@ class ShadowKVLayer(DynamicLayer):
             return
 
         new_capacity = max(required_capacity, self.capacity * 2, 1024)
+        new_chunk_cap = math.ceil(new_capacity / self.chunk_size)
         pin = torch.cuda.is_available()
 
         new_A = torch.empty((batch_size, num_kv, new_capacity, eff_rank), dtype=target_dtype, device=target_device)
+        new_lm = torch.zeros((batch_size, num_kv, new_chunk_cap, head_dim), dtype=target_dtype, device=target_device)
         new_cpu_v = torch.empty(
             (batch_size, num_kv, new_capacity, head_dim), dtype=target_dtype, device="cpu", pin_memory=pin
         )
 
         if self.total_tokens_seen > 0 and self.gpu_k_A is not None and self.cpu_v_buf is not None:
             t = self.total_tokens_seen
+            c_used = math.ceil(t / self.chunk_size)
             new_A[:, :, :t].copy_(self.gpu_k_A[:, :, :t])
+            if self.gpu_landmarks is not None:
+                new_lm[:, :, :c_used].copy_(self.gpu_landmarks[:, :, :c_used])
             new_cpu_v[:, :, :t].copy_(self.cpu_v_buf[:, :, :t])
 
         self.gpu_k_A = new_A
+        self.gpu_landmarks = new_lm
         self.cpu_v_buf = new_cpu_v
         self.capacity = new_capacity
+        self.chunk_capacity = new_chunk_cap
+
+    def _update_incremental_landmarks(self, start_pos: int, end_pos: int) -> None:
+        """Update cached chunk landmarks ONLY for newly written token positions."""
+        assert self.gpu_k_A is not None and self.gpu_k_B is not None and self.gpu_landmarks is not None
+        c_start = start_pos // self.chunk_size
+        c_end = (end_pos - 1) // self.chunk_size
+
+        # Fast vectorized update across aligned blocks when updating >= 1 full chunk
+        if (c_start * self.chunk_size) == start_pos and (end_pos - start_pos) > self.chunk_size:
+            num_chunks_touched = c_end - c_start + 1
+            k_slice = torch.matmul(
+                self.gpu_k_A[:, :, start_pos:end_pos].float(), self.gpu_k_B.float()
+            )
+            pad_len = num_chunks_touched * self.chunk_size - (end_pos - start_pos)
+            k_pad = F.pad(k_slice, (0, 0, 0, pad_len)) if pad_len > 0 else k_slice
+            valid_counts = torch.full((num_chunks_touched,), self.chunk_size, device=k_pad.device, dtype=torch.float32)
+            if pad_len > 0:
+                valid_counts[-1] = self.chunk_size - pad_len
+            chunk_sums = k_pad.reshape(
+                k_pad.shape[0], k_pad.shape[1], num_chunks_touched, self.chunk_size, self.head_dim
+            ).sum(dim=-2)
+            self.gpu_landmarks[:, :, c_start : c_end + 1] = (
+                chunk_sums / valid_counts.view(1, 1, num_chunks_touched, 1)
+            ).to(self.target_dtype)
+            return
+
+        for c in range(c_start, c_end + 1):
+            t_s = c * self.chunk_size
+            t_e = min(end_pos, (c + 1) * self.chunk_size)
+            k_c = torch.matmul(self.gpu_k_A[:, :, t_s:t_e].float(), self.gpu_k_B.float())
+            self.gpu_landmarks[:, :, c] = k_c.mean(dim=-2).to(self.target_dtype)
 
     def update(
         self,
@@ -169,7 +209,6 @@ class ShadowKVLayer(DynamicLayer):
 
         curr = self.total_tokens_seen
 
-        # Initialize low-rank SVD subspace B on initial prefill
         if self.gpu_k_B is None:
             eff_rank = min(self.rank, head_dim)
             if new_tokens >= eff_rank:
@@ -182,8 +221,6 @@ class ShadowKVLayer(DynamicLayer):
                 assert self.gpu_k_A is not None
                 self.gpu_k_A[:, :, curr : curr + new_tokens].copy_(A_init)
             else:
-                # Sequence too short for truncated SVD: fallback to identity basis slice
-                eff_rank = min(self.rank, head_dim)
                 self.effective_rank = eff_rank
                 self.gpu_k_B = torch.eye(eff_rank, head_dim, dtype=key_states.dtype, device=key_states.device).expand(
                     batch_size, num_kv, eff_rank, head_dim
@@ -195,7 +232,6 @@ class ShadowKVLayer(DynamicLayer):
                 proj = torch.matmul(key_states.float(), self.gpu_k_B.float().transpose(-2, -1)).to(key_states.dtype)
                 self.gpu_k_A[:, :, curr : curr + new_tokens].copy_(proj)
         else:
-            # ShadowKV+: project arriving tokens directly onto fixed prefill SVD basis B^T
             assert self.gpu_k_B is not None
             self._ensure_capacity(
                 batch_size, num_kv, head_dim, self.effective_rank, key_states.device, key_states.dtype, curr + new_tokens
@@ -209,26 +245,24 @@ class ShadowKVLayer(DynamicLayer):
         self.cpu_v_buf[:, :, curr : curr + new_tokens].copy_(value_states, non_blocking=True)
         self.total_bytes_transferred_pcie += value_states.nelement() * value_states.element_size()
 
-        self.total_tokens_seen += new_tokens
+        new_total = curr + new_tokens
+        self.total_tokens_seen = new_total
+
+        # Incrementally update cached GPU landmarks only for touched chunks
+        self._update_incremental_landmarks(curr, new_total)
+
         threshold_tokens = self.sparse_budget_chunks * self.chunk_size
 
         # Sparse landmark selection + selective PCIe value prefetch during decode
-        if new_tokens == 1 and self.total_tokens_seen > threshold_tokens:
-            assert self.gpu_k_A is not None and self.gpu_k_B is not None
-            k_full_recon = torch.matmul(
-                self.gpu_k_A[:, :, : self.total_tokens_seen].float(), self.gpu_k_B.float()
-            )
-            num_chunks = math.ceil(self.total_tokens_seen / self.chunk_size)
-            pad_len = num_chunks * self.chunk_size - self.total_tokens_seen
-            k_pad = F.pad(k_full_recon, (0, 0, 0, pad_len)) if pad_len > 0 else k_full_recon
-            landmarks = k_pad.reshape(batch_size, num_kv, num_chunks, self.chunk_size, head_dim).mean(dim=-2)
+        if new_tokens == 1 and new_total > threshold_tokens:
+            assert self.gpu_k_A is not None and self.gpu_k_B is not None and self.gpu_landmarks is not None
+            num_chunks = math.ceil(new_total / self.chunk_size)
+            landmarks_view = self.gpu_landmarks[:, :, :num_chunks, :]
 
-            # Proxy score using latest key normalized direction
-            proxy_scores = torch.matmul(key_states.float(), landmarks.transpose(-2, -1)).mean(dim=(0, 1, 2))
+            proxy_scores = torch.matmul(key_states.float(), landmarks_view.float().transpose(-2, -1)).mean(dim=(0, 1, 2))
             top_k = min(self.sparse_budget_chunks, num_chunks)
             _, top_chunks = torch.topk(proxy_scores, k=top_k)
 
-            # Always anchor chunk 0 (sink) and recent chunk (current token)
             selected_set = set(top_chunks.tolist()) | {0, num_chunks - 1}
             missed_chunks = selected_set.difference(self.last_selected_chunks)
             self.last_selected_chunks = selected_set
@@ -236,14 +270,16 @@ class ShadowKVLayer(DynamicLayer):
             fetch_indices: list[int] = []
             for c in sorted(selected_set):
                 s = c * self.chunk_size
-                e = min(self.total_tokens_seen, (c + 1) * self.chunk_size)
+                e = min(new_total, (c + 1) * self.chunk_size)
                 fetch_indices.extend(range(s, e))
 
             self.active_positions = fetch_indices
             idx_t = torch.tensor(fetch_indices, dtype=torch.long, device=key_states.device)
-            k_active = k_full_recon[:, :, idx_t, :].to(key_states.dtype)
 
-            # PCIe transfer only for chunks not cached temporally in GPU working set
+            # Sparse key reconstruction ONLY for selected indices (zero full-sequence reconstruction!)
+            a_sparse = self.gpu_k_A[:, :, idx_t, :]
+            k_active = torch.matmul(a_sparse.float(), self.gpu_k_B.float()).to(key_states.dtype)
+
             idx_cpu = torch.tensor(fetch_indices, dtype=torch.long)
             v_active = self.cpu_v_buf[:, :, idx_cpu, :].to(key_states.device, non_blocking=True)
             if missed_chunks:
@@ -254,13 +290,12 @@ class ShadowKVLayer(DynamicLayer):
 
             return k_active, v_active
 
-        # During prefill or short prompts, retain all positions
-        self.active_positions = list(range(self.total_tokens_seen))
+        self.active_positions = list(range(new_total))
         assert self.gpu_k_A is not None and self.gpu_k_B is not None
         k_out = torch.matmul(
-            self.gpu_k_A[:, :, : self.total_tokens_seen].float(), self.gpu_k_B.float()
+            self.gpu_k_A[:, :, :new_total].float(), self.gpu_k_B.float()
         ).to(key_states.dtype)
-        v_out = self.cpu_v_buf[:, :, : self.total_tokens_seen].to(key_states.device, non_blocking=True)
+        v_out = self.cpu_v_buf[:, :, :new_total].to(key_states.device, non_blocking=True)
         return k_out, v_out
 
     def get_seq_length(self) -> int:
