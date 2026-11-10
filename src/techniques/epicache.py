@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
 from typing import Any
 
 try:
@@ -32,12 +30,9 @@ def compute_layer_sensitivity_budgets(
     """
     total_tokens = total_layers * base_budget_per_layer
 
-    # Synthetic canonical layer sensitivity curve: high at extremes, lower in the middle
     sensitivities = []
     for l in range(total_layers):
-        # Normalized position in [0, 1]
         x = l / max(total_layers - 1, 1)
-        # U-shaped sensitivity profile
         sens = 0.3 + 0.7 * (4.0 * (x - 0.5) ** 2)
         sensitivities.append(sens ** alpha)
 
@@ -66,7 +61,7 @@ def route_query_to_episode(
     if torch is None or F is None:
         raise RuntimeError("PyTorch is required for route_query_to_episode")
 
-    q_norm = F.normalize(query_emb.float().view(1, -1), p=2, dim=-1)
+    q_norm = F.normalize(query_emb.float().reshape(1, -1), p=2, dim=-1)
     c_norm = F.normalize(episode_centroids.float(), p=2, dim=-1)
     sims = torch.matmul(q_norm, c_norm.transpose(0, 1)).squeeze(0)
     return int(torch.argmax(sims).item())
@@ -92,12 +87,10 @@ def evict_block_prefill(
         indices = torch.arange(seq_len, device=k_block.device)
         return k_block, v_block, indices
 
-    # Score tokens by mean Key norm across heads
-    key_scores = k_block.norm(p=2, dim=-1).mean(dim=(0, 1))  # (seq_len,)
-    # Always keep token 0
+    key_scores = k_block.float().norm(p=2, dim=-1).mean(dim=(0, 1))
     k_top = max(1, budget - 1)
     _, top_idx = torch.topk(key_scores[1:], k=min(k_top, seq_len - 1))
-    top_idx = top_idx + 1  # Offset for token 0
+    top_idx = top_idx + 1
     retained_idx = torch.unique(torch.cat([torch.tensor([0], device=top_idx.device), top_idx]))
 
     if retained_idx.numel() > budget:
@@ -123,10 +116,8 @@ def compute_gqa_epicache_attention(
     d = query.size(-1)
     orig_seq_len = key.size(-2)
 
-    # 1. Prune within block budget
     k_active, v_active, retained_idx = evict_block_prefill(key, value, budget=budget)
 
-    # 2. GQA expansion
     num_q_heads = query.size(1)
     num_kv_heads = key.size(1)
     gqa_ratio = num_q_heads // num_kv_heads
@@ -211,14 +202,28 @@ class EpiCacheTechnique(Technique):
     def workload(self) -> Workload:
         return SyntheticFiller()
 
+    def pytorch_cache_factory(self) -> Any:
+        from src.techniques.epicache_cache import EpiCacheCache
+
+        return lambda: EpiCacheCache(
+            episode_budget_tokens=self.episode_budget_tokens,
+            layer_sensitivity_alpha=self.layer_sensitivity_alpha,
+        )
+
     def extra_metrics(self, llm, workload_output) -> dict[str, Any]:
         del llm, workload_output
+        from src.techniques.epicache_cache import get_active_epicache_cache
+
+        active_cache = get_active_epicache_cache()
+        retained_tokens = active_cache.get_seq_length(0) if active_cache is not None else 0
+
         return {
             "num_episodes": self.num_episodes,
             "episode_budget_tokens": self.episode_budget_tokens,
             "layer_sensitivity_alpha": self.layer_sensitivity_alpha,
             "compression_ratio_vs_bf16": self.compression_ratio,
             "block_size": self.block_size,
+            "active_retained_tokens": retained_tokens,
             "block_wise_prefill_active": True,
             "episodic_routing_active": True,
         }

@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import torch
 
 from src.core.axis import Axis
+from src.core.diagnostic import inspect_sample_diagnostic
+from src.core.pytorch_runner import PyTorchRunner
 from src.core.registry import get_technique, list_techniques
 from src.techniques.epicache import (
     EpiCacheTechnique,
@@ -11,6 +13,11 @@ from src.techniques.epicache import (
     compute_layer_sensitivity_budgets,
     evict_block_prefill,
     route_query_to_episode,
+)
+from src.techniques.epicache_cache import (
+    EpiCacheCache,
+    EpiCacheLayer,
+    get_active_epicache_cache,
 )
 
 
@@ -52,10 +59,8 @@ class TestEpiCacheTechnique(unittest.TestCase):
     def test_layer_sensitivity_budgets(self):
         budgets = compute_layer_sensitivity_budgets(total_layers=16, base_budget_per_layer=512, alpha=2.0)
         self.assertEqual(len(budgets), 16)
-        # All layer budgets must be positive and non-trivial
         for l, b in budgets.items():
             self.assertGreaterEqual(b, 64)
-        # Sum of budgets should be within reasonable bounds of total allocation
         self.assertAlmostEqual(sum(budgets.values()) / (16 * 512), 1.0, delta=0.05)
 
     def test_route_query_to_episode(self):
@@ -64,7 +69,6 @@ class TestEpiCacheTechnique(unittest.TestCase):
 
         torch.manual_seed(42)
         centroids = torch.randn(num_episodes, dim, dtype=torch.float32)
-        # Query closely aligned with episode 2
         query_emb = centroids[2] + 0.01 * torch.randn(dim)
 
         best_ep = route_query_to_episode(query_emb, centroids)
@@ -81,12 +85,11 @@ class TestEpiCacheTechnique(unittest.TestCase):
         k_ret, v_ret, indices = evict_block_prefill(k, v, budget=budget)
         self.assertEqual(k_ret.shape[-2], budget)
         self.assertEqual(v_ret.shape[-2], budget)
-        # Attention sink (token 0) must always be preserved
         self.assertIn(0, indices.tolist())
 
     def test_compute_gqa_epicache_attention(self):
         batch, seq_len_q, head_dim = 1, 1, 32
-        num_q_heads, num_kv_heads = 8, 2  # 4:1 GQA ratio
+        num_q_heads, num_kv_heads = 8, 2
         seq_len_kv = 64
 
         torch.manual_seed(200)
@@ -100,6 +103,60 @@ class TestEpiCacheTechnique(unittest.TestCase):
         self.assertTrue(torch.allclose(attn_weights.sum(dim=-1), torch.ones_like(attn_weights.sum(dim=-1)), atol=1e-4))
         self.assertEqual(telemetry["active_tokens"], 16)
         self.assertTrue(telemetry["block_prefill_capped"])
+
+    def test_epicache_layer_chunk_pruning_and_decode(self):
+        torch.manual_seed(123)
+        cache = EpiCacheCache(total_layers=4, episode_budget_tokens=16)
+        self.assertEqual(get_active_epicache_cache(), cache)
+
+        batch, heads, dim = 1, 4, 64
+        k_chunk = torch.randn(batch, 32, heads, dim, dtype=torch.bfloat16).transpose(1, 2)
+        v_chunk = torch.randn(batch, 32, heads, dim, dtype=torch.bfloat16).transpose(1, 2)
+
+        cache.update(k_chunk, v_chunk, layer_idx=0)
+        cache.prune_after_chunk()
+        self.assertEqual(cache.get_seq_length(0), 16)
+        self.assertIn(0, cache.original_positions)
+
+        # Decode 1 token beyond budget -> automatically re-prunes to budget 16
+        k_dec = torch.randn(batch, heads, 1, dim, dtype=torch.bfloat16)
+        v_dec = torch.randn(batch, heads, 1, dim, dtype=torch.bfloat16)
+        out_k, _ = cache.update(k_dec, v_dec, layer_idx=0)
+        self.assertEqual(out_k.shape[-2], 16)
+
+    def test_epicache_factory_diagnostic_and_pytorch_runner(self):
+        technique = get_technique("epicache", episode_budget_tokens=16)
+        cache_factory = technique.pytorch_cache_factory()
+        self.assertIsNotNone(cache_factory)
+
+        cache = cache_factory()
+        self.assertIsInstance(cache, EpiCacheCache)
+
+        k1 = torch.randn(1, 4, 40, 64, dtype=torch.float32)
+        v1 = torch.randn(1, 4, 40, 64, dtype=torch.float32)
+        cache.update(k1, v1, layer_idx=0)
+        cache.prune_after_chunk()
+
+        diag = inspect_sample_diagnostic(
+            cache=cache,
+            prompt_text="Test EpiCache diagnostic",
+            prompt_token_ids=list(range(40)),
+            sample_meta={"id": "ec_diag_0", "task_type": "unit"},
+            is_correct=True,
+            baseline_correct=True,
+            bits_per_scalar=16.0,
+        )
+        self.assertAlmostEqual(diag.overall_retention_ratio, 16 / 40, places=3)
+
+        runner = PyTorchRunner(
+            model_name_or_path="Qwen/Qwen3-4B-Instruct-2507",
+            revision="cdbee75f17c01a7cc42f958dc650907174af0554",
+            cache_factory=cache_factory,
+            dry_run=True,
+        )
+        outputs = runner.generate(["Test EpiCache prompt."], max_tokens=16)
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(len(outputs[0].outputs[0].token_ids), 16)
 
 
 if __name__ == "__main__":
