@@ -11,7 +11,6 @@ except ImportError:
     torch = None  # type: ignore[assignment]
 
 from transformers.cache_utils import Cache, DynamicLayer
-from src.techniques.cachegen import quantize_deltas_tiered
 
 _ACTIVE_CACHEGEN_CACHE_REF: weakref.ReferenceType[CacheGenCache] | None = None
 
@@ -61,11 +60,12 @@ class CacheGenLayer(DynamicLayer):
         self.group_capacity: int = 0
         self.total_tokens_seen: int = 0
         self.head_dim: int = 0
-        self.effective_bits: int = self.shallow_bits
+        self.effective_bits: int = self._resolve_tier_bits()
+        self.pack_bits: int = 8
         self.target_dtype: Any = None
         self.target_device: Any = None
 
-        # Pre-allocated Anchor + Quantized Delta buffers
+        # Pre-allocated Anchor + Bit-Packed Quantized Delta buffers
         self.k_anchors_buf: torch.Tensor | None = None
         self.k_delta_q_buf: torch.Tensor | None = None
         self.k_delta_s_buf: torch.Tensor | None = None
@@ -75,6 +75,56 @@ class CacheGenLayer(DynamicLayer):
         self.v_delta_s_buf: torch.Tensor | None = None
 
         super().__init__()
+
+    def _resolve_tier_bits(self) -> int:
+        tier_cutoff_1 = self.total_layers // 3
+        tier_cutoff_2 = (2 * self.total_layers) // 3
+        if self.layer_idx < tier_cutoff_1:
+            return self.shallow_bits
+        if self.layer_idx < tier_cutoff_2:
+            return self.mid_bits
+        return self.deep_bits
+
+    def _packing_spec(self, head_dim: int) -> tuple[int, int, Any]:
+        """Return (pack_bits, packed_cols, storage_dtype) for this layer tier."""
+        bits = self.effective_bits
+        if bits == 4 and head_dim % 2 == 0:
+            return 4, head_dim // 2, torch.uint8
+        if bits == 2 and head_dim % 4 == 0:
+            return 2, head_dim // 4, torch.uint8
+        return 8, head_dim, torch.int8
+
+    def _pack_quantized(self, deltas: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize delta tensor to layer tier bitwidth and bit-pack along head_dim."""
+        bits = self.effective_bits
+        max_val = (1 << (bits - 1)) - 1
+        min_val = -(1 << (bits - 1))
+        scale = deltas.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6) / float(max_val)
+        q = torch.round(deltas / scale).clamp(min_val, max_val)
+
+        if self.pack_bits == 4:
+            u = (q.to(torch.int16) + 8).to(torch.uint8).reshape(*deltas.shape[:-1], -1, 2)
+            packed = u[..., 0] | (u[..., 1] << 4)
+            return packed, scale.to(deltas.dtype)
+        if self.pack_bits == 2:
+            u = (q.to(torch.int16) + 2).to(torch.uint8).reshape(*deltas.shape[:-1], -1, 4)
+            packed = u[..., 0] | (u[..., 1] << 2) | (u[..., 2] << 4) | (u[..., 3] << 6)
+            return packed, scale.to(deltas.dtype)
+        return q.to(torch.int8), scale.to(deltas.dtype)
+
+    def _unpack_quantized(self, packed: torch.Tensor) -> torch.Tensor:
+        """Unpack stored delta integers directly into self.target_dtype."""
+        if self.pack_bits == 4:
+            lo = (packed & 0x0F).to(torch.int16) - 8
+            hi = ((packed >> 4) & 0x0F).to(torch.int16) - 8
+            return torch.stack((lo, hi), dim=-1).reshape(*packed.shape[:-1], self.head_dim).to(self.target_dtype)
+        if self.pack_bits == 2:
+            q0 = (packed & 0x03).to(torch.int16) - 2
+            q1 = ((packed >> 2) & 0x03).to(torch.int16) - 2
+            q2 = ((packed >> 4) & 0x03).to(torch.int16) - 2
+            q3 = ((packed >> 6) & 0x03).to(torch.int16) - 2
+            return torch.stack((q0, q1, q2, q3), dim=-1).reshape(*packed.shape[:-1], self.head_dim).to(self.target_dtype)
+        return packed.to(self.target_dtype)
 
     @property
     def original_positions(self) -> list[int]:
@@ -93,9 +143,19 @@ class CacheGenLayer(DynamicLayer):
             dq = self.v_delta_q_buf[:, :, :t, :]
             ds = self.v_delta_s_buf[:, :, :t, :]
 
-        expanded_anchors = anchors.repeat_interleave(g, dim=-2)[:, :, :t, :]
-        deltas_recon = dq.to(self.target_dtype) * ds.to(self.target_dtype)
-        return (expanded_anchors + deltas_recon).to(self.target_dtype)
+        recon = self._unpack_quantized(dq)
+        recon.mul_(ds)
+
+        b, h, _, d = anchors.shape
+        full_groups = t // g
+        full_tokens = full_groups * g
+        if full_groups > 0:
+            recon[:, :, :full_tokens, :].view(b, h, full_groups, g, d).add_(
+                anchors[:, :, :full_groups, :].unsqueeze(-2)
+            )
+        if full_tokens < t:
+            recon[:, :, full_tokens:, :].add_(anchors[:, :, full_groups : full_groups + 1, :])
+        return recon
 
     @property
     def keys(self) -> torch.Tensor | None:
@@ -123,6 +183,7 @@ class CacheGenLayer(DynamicLayer):
         self.target_dtype = key_states.dtype
         self.target_device = key_states.device
         self.head_dim = key_states.shape[-1]
+        self.pack_bits, _, _ = self._packing_spec(self.head_dim)
         self.is_initialized = True
 
     def _ensure_capacity(
@@ -137,34 +198,55 @@ class CacheGenLayer(DynamicLayer):
         if self.capacity >= required_capacity:
             return
 
-        new_capacity = max(required_capacity, self.capacity * 2, 1024)
+        if required_capacity <= 2048:
+            new_capacity = max(required_capacity, self.capacity * 2, 1024)
+        else:
+            # Linear headroom past 2K avoids 16K->32K->64K doubling spikes under 16GB cap
+            new_capacity = max(required_capacity + 256, self.capacity)
+
         new_group_cap = math.ceil(new_capacity / self.anchor_group_size)
+        _, q_cols, q_dtype = self._packing_spec(head_dim)
 
-        new_ka = torch.empty((batch_size, num_kv, new_group_cap, head_dim), dtype=target_dtype, device=target_device)
-        new_kdq = torch.empty((batch_size, num_kv, new_capacity, head_dim), dtype=torch.int8, device=target_device)
-        new_kds = torch.empty((batch_size, num_kv, new_capacity, 1), dtype=target_dtype, device=target_device)
-
-        new_va = torch.empty_like(new_ka)
-        new_vdq = torch.empty_like(new_kdq)
-        new_vds = torch.empty_like(new_kds)
-
+        saved_cpu = None
         if self.total_tokens_seen > 0 and self.k_anchors_buf is not None:
             t = self.total_tokens_seen
             g_used = math.ceil(t / self.anchor_group_size)
-            new_ka[:, :, :g_used].copy_(self.k_anchors_buf[:, :, :g_used])
-            new_kdq[:, :, :t].copy_(self.k_delta_q_buf[:, :, :t])
-            new_kds[:, :, :t].copy_(self.k_delta_s_buf[:, :, :t])
+            saved_cpu = (
+                t,
+                g_used,
+                self.k_anchors_buf[:, :, :g_used].cpu(),
+                self.k_delta_q_buf[:, :, :t].cpu(),
+                self.k_delta_s_buf[:, :, :t].cpu(),
+                self.v_anchors_buf[:, :, :g_used].cpu(),
+                self.v_delta_q_buf[:, :, :t].cpu(),
+                self.v_delta_s_buf[:, :, :t].cpu(),
+            )
 
-            new_va[:, :, :g_used].copy_(self.v_anchors_buf[:, :, :g_used])
-            new_vdq[:, :, :t].copy_(self.v_delta_q_buf[:, :, :t])
-            new_vds[:, :, :t].copy_(self.v_delta_s_buf[:, :, :t])
+        # Drop old GPU buffers before allocating larger ones to avoid 2x VRAM peak
+        self.k_anchors_buf = None
+        self.k_delta_q_buf = None
+        self.k_delta_s_buf = None
+        self.v_anchors_buf = None
+        self.v_delta_q_buf = None
+        self.v_delta_s_buf = None
 
-        self.k_anchors_buf = new_ka
-        self.k_delta_q_buf = new_kdq
-        self.k_delta_s_buf = new_kds
-        self.v_anchors_buf = new_va
-        self.v_delta_q_buf = new_vdq
-        self.v_delta_s_buf = new_vds
+        self.k_anchors_buf = torch.empty((batch_size, num_kv, new_group_cap, head_dim), dtype=target_dtype, device=target_device)
+        self.k_delta_q_buf = torch.empty((batch_size, num_kv, new_capacity, q_cols), dtype=q_dtype, device=target_device)
+        self.k_delta_s_buf = torch.empty((batch_size, num_kv, new_capacity, 1), dtype=target_dtype, device=target_device)
+
+        self.v_anchors_buf = torch.empty_like(self.k_anchors_buf)
+        self.v_delta_q_buf = torch.empty_like(self.k_delta_q_buf)
+        self.v_delta_s_buf = torch.empty_like(self.k_delta_s_buf)
+
+        if saved_cpu is not None:
+            t, g_used, ka, kdq, kds, va, vdq, vds = saved_cpu
+            self.k_anchors_buf[:, :, :g_used].copy_(ka, non_blocking=False)
+            self.k_delta_q_buf[:, :, :t].copy_(kdq, non_blocking=False)
+            self.k_delta_s_buf[:, :, :t].copy_(kds, non_blocking=False)
+            self.v_anchors_buf[:, :, :g_used].copy_(va, non_blocking=False)
+            self.v_delta_q_buf[:, :, :t].copy_(vdq, non_blocking=False)
+            self.v_delta_s_buf[:, :, :t].copy_(vds, non_blocking=False)
+
         self.capacity = new_capacity
         self.group_capacity = new_group_cap
 
@@ -186,6 +268,8 @@ class CacheGenLayer(DynamicLayer):
         self.target_dtype = key_states.dtype
         self.target_device = key_states.device
         self.head_dim = head_dim
+        self.effective_bits = self._resolve_tier_bits()
+        self.pack_bits, _, _ = self._packing_spec(head_dim)
 
         curr = self.total_tokens_seen
         self._ensure_capacity(
@@ -193,7 +277,6 @@ class CacheGenLayer(DynamicLayer):
         )
 
         g = self.anchor_group_size
-        # Record anchors at any position where (curr + offset) % g == 0
         positions = torch.arange(curr, curr + new_tokens, device=key_states.device)
         is_anchor = (positions % g) == 0
         if is_anchor.any():
@@ -202,36 +285,26 @@ class CacheGenLayer(DynamicLayer):
             self.k_anchors_buf[:, :, anchor_group_idx, :] = key_states[:, :, anchor_local_idx, :]
             self.v_anchors_buf[:, :, anchor_group_idx, :] = value_states[:, :, anchor_local_idx, :]
 
-        # Lookup active anchors for incoming positions
         group_ids = positions // g
+
+        # Process K then V sequentially to minimize peak temporary tensor footprint during prefill
         active_k_anchors = self.k_anchors_buf[:, :, group_ids, :]
-        active_v_anchors = self.v_anchors_buf[:, :, group_ids, :]
-
         k_deltas = key_states - active_k_anchors
+        del active_k_anchors
+        k_q, k_s = self._pack_quantized(k_deltas)
+        del k_deltas
+        self.k_delta_q_buf[:, :, curr : curr + new_tokens].copy_(k_q)
+        self.k_delta_s_buf[:, :, curr : curr + new_tokens].copy_(k_s)
+        del k_q, k_s
+
+        active_v_anchors = self.v_anchors_buf[:, :, group_ids, :]
         v_deltas = value_states - active_v_anchors
-
-        k_q, k_s, _, bits = quantize_deltas_tiered(
-            k_deltas,
-            layer_idx=self.layer_idx,
-            total_layers=self.total_layers,
-            shallow_bits=self.shallow_bits,
-            mid_bits=self.mid_bits,
-            deep_bits=self.deep_bits,
-        )
-        v_q, v_s, _, _ = quantize_deltas_tiered(
-            v_deltas,
-            layer_idx=self.layer_idx,
-            total_layers=self.total_layers,
-            shallow_bits=self.shallow_bits,
-            mid_bits=self.mid_bits,
-            deep_bits=self.deep_bits,
-        )
-        self.effective_bits = bits
-
-        self.k_delta_q_buf[:, :, curr : curr + new_tokens].copy_(k_q.to(torch.int8))
-        self.k_delta_s_buf[:, :, curr : curr + new_tokens].copy_(k_s.to(key_states.dtype))
-        self.v_delta_q_buf[:, :, curr : curr + new_tokens].copy_(v_q.to(torch.int8))
-        self.v_delta_s_buf[:, :, curr : curr + new_tokens].copy_(v_s.to(value_states.dtype))
+        del active_v_anchors
+        v_q, v_s = self._pack_quantized(v_deltas)
+        del v_deltas
+        self.v_delta_q_buf[:, :, curr : curr + new_tokens].copy_(v_q)
+        self.v_delta_s_buf[:, :, curr : curr + new_tokens].copy_(v_s)
+        del v_q, v_s
 
         self.total_tokens_seen += new_tokens
 
@@ -248,7 +321,6 @@ class CacheGenLayer(DynamicLayer):
         g_used = math.ceil(t / self.anchor_group_size)
         batch, heads = self.k_delta_q_buf.shape[0], self.k_delta_q_buf.shape[1]
         anchor_bytes = 2 * batch * heads * g_used * self.head_dim * self.k_anchors_buf.element_size()
-        # Bitstream delta footprint governed by layer-tiered bitwidth
         delta_bits_bytes = int(math.ceil(2 * batch * heads * t * self.head_dim * (self.effective_bits / 8.0)))
         scale_bytes = 2 * batch * heads * t * self.k_delta_s_buf.element_size()
         return anchor_bytes + delta_bits_bytes + scale_bytes
@@ -262,6 +334,14 @@ class CacheGenLayer(DynamicLayer):
     def reset(self) -> None:
         self.total_tokens_seen = 0
         self.is_initialized = False
+        self.capacity = 0
+        self.group_capacity = 0
+        self.k_anchors_buf = None
+        self.k_delta_q_buf = None
+        self.k_delta_s_buf = None
+        self.v_anchors_buf = None
+        self.v_delta_q_buf = None
+        self.v_delta_s_buf = None
         self._keys_fallback = None
         self._values_fallback = None
         if hasattr(self, "cumulative_length"):
