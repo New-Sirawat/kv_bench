@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Any
 
 try:
@@ -44,18 +43,16 @@ def encode_anchor_deltas(
     head_dim = tensor.size(-1)
     num_groups = math.ceil(seq_len / group_size)
 
-    # Pad seq_len to a multiple of group_size
     pad_len = num_groups * group_size - seq_len
     if pad_len > 0:
         tensor_padded = F.pad(tensor, (0, 0, 0, pad_len))
     else:
         tensor_padded = tensor
 
-    # Reshape: (batch, heads, num_groups, group_size, head_dim)
-    grouped = tensor_padded.view(*tensor.shape[:-2], num_groups, group_size, head_dim)
+    grouped = tensor_padded.contiguous().reshape(*tensor.shape[:-2], num_groups, group_size, head_dim)
 
-    anchors = grouped[..., 0:1, :].contiguous()  # First token of each group
-    deltas = grouped - anchors                  # Delta from anchor (position 0 is exactly zero)
+    anchors = grouped[..., 0:1, :].contiguous()
+    deltas = grouped - anchors
 
     return anchors, deltas, seq_len
 
@@ -69,14 +66,13 @@ def decode_anchor_deltas(
     if torch is None:
         raise RuntimeError("PyTorch is required for decode_anchor_deltas")
 
-    # Reconstructed: tensor_i = anchor + delta_i
     reconstructed = anchors + deltas
     shape = list(reconstructed.shape)
     num_groups = shape[-3]
     group_size = shape[-2]
     head_dim = shape[-1]
 
-    flat_seq = reconstructed.view(*shape[:-3], num_groups * group_size, head_dim)
+    flat_seq = reconstructed.contiguous().reshape(*shape[:-3], num_groups * group_size, head_dim)
     return flat_seq[..., :original_seq_len, :].contiguous()
 
 
@@ -116,7 +112,7 @@ def quantize_deltas_tiered(
 
     scale = deltas.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6) / float(max_val)
     q = torch.round(deltas / scale).clamp(min_val, max_val)
-    dequant = q.to(deltas.dtype) * scale
+    dequant = q.to(deltas.dtype) * scale.to(deltas.dtype)
 
     return q, scale, dequant, bits
 
@@ -148,7 +144,7 @@ def compute_gqa_cachegen_attention(
     _, _, k_deltas_dequant, k_bits = quantize_deltas_tiered(
         k_deltas, layer_idx, total_layers, shallow_bits, mid_bits, deep_bits
     )
-    _, _, v_deltas_dequant, v_bits = quantize_deltas_tiered(
+    _, _, v_deltas_dequant, _ = quantize_deltas_tiered(
         v_deltas, layer_idx, total_layers, shallow_bits, mid_bits, deep_bits
     )
 
@@ -224,7 +220,6 @@ class CacheGenTechnique(Technique):
     @property
     def compression_ratio(self) -> float:
         """Average compression ratio across all layer tiers relative to 16-bit FP16."""
-        # Mean bitwidth across 3 equal tiers: (8 + 4 + 2) / 3 = 4.67 bits
         mean_bits = (self.shallow_bits + self.mid_bits + self.deep_bits) / 3.0
         return round(16.0 / mean_bits, 2)
 
@@ -240,8 +235,24 @@ class CacheGenTechnique(Technique):
     def workload(self) -> Workload:
         return SyntheticFiller()
 
+    def pytorch_cache_factory(self) -> Any:
+        from src.techniques.cachegen_cache import CacheGenCache
+
+        return lambda: CacheGenCache(
+            anchor_group_size=self.anchor_group_size,
+            shallow_bits=self.shallow_bits,
+            mid_bits=self.mid_bits,
+            deep_bits=self.deep_bits,
+        )
+
     def extra_metrics(self, llm, workload_output) -> dict[str, Any]:
         del llm, workload_output
+        from src.techniques.cachegen_cache import get_active_cachegen_cache
+
+        active_cache = get_active_cachegen_cache()
+        compressed_bytes = (
+            active_cache.total_compressed_bytes if active_cache is not None else 0
+        )
         return {
             "anchor_group_size": self.anchor_group_size,
             "shallow_bits": self.shallow_bits,
@@ -249,6 +260,7 @@ class CacheGenTechnique(Technique):
             "deep_bits": self.deep_bits,
             "compression_ratio_vs_bf16": self.compression_ratio,
             "block_size": self.block_size,
+            "compressed_bitstream_bytes": compressed_bytes,
             "delta_encoding_active": True,
             "layer_tiered_quantization_active": True,
         }
