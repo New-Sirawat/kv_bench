@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import torch
 
 from src.core.axis import Axis
+from src.core.diagnostic import inspect_sample_diagnostic
+from src.core.pytorch_runner import PyTorchRunner
 from src.core.registry import get_technique, list_techniques
 from src.techniques.turboquant import (
     TurboQuantTechnique,
@@ -11,11 +13,15 @@ from src.techniques.turboquant import (
     dequantize_key_4bit,
     dequantize_value_3plus1bit,
     fast_walsh_hadamard_transform,
-    get_random_sign_vector,
     quantize_key_4bit,
     quantize_value_3plus1bit,
     turboquant_rotate,
     turboquant_unrotate,
+)
+from src.techniques.turboquant_cache import (
+    TurboQuantCache,
+    TurboQuantLayer,
+    get_active_turboquant_cache,
 )
 
 
@@ -51,19 +57,17 @@ class TestTurboQuantTechnique(unittest.TestCase):
         with self.assertRaises(ValueError):
             TurboQuantTechnique(key_bits=8)
         with self.assertRaises(ValueError):
-            TurboQuantTechnique(val_scalar_bits=2, val_qjl_bits=1)  # sum != 4
+            TurboQuantTechnique(val_scalar_bits=2, val_qjl_bits=1)
         with self.assertRaises(ValueError):
             TurboQuantTechnique(block_size=0)
 
     def test_fast_walsh_hadamard_transform_involution(self):
-        # FWHT must be its own exact inverse: FWHT(FWHT(x)) == x
         torch.manual_seed(42)
         x = torch.randn(2, 4, 64, dtype=torch.float32)
         x_fwht = fast_walsh_hadamard_transform(x)
         x_recon = fast_walsh_hadamard_transform(x_fwht)
         self.assertTrue(torch.allclose(x, x_recon, atol=1e-5))
 
-        # Check non-power-of-2 dimension raises ValueError
         x_bad = torch.randn(2, 4, 50)
         with self.assertRaises(ValueError):
             fast_walsh_hadamard_transform(x_bad)
@@ -73,11 +77,9 @@ class TestTurboQuantTechnique(unittest.TestCase):
         v = torch.randn(2, 8, 32, 64, dtype=torch.float32)
         v_rot, v_norms = turboquant_rotate(v, seed=42)
 
-        # Norms should be positive and vector should be spherical
         self.assertEqual(v_rot.shape, v.shape)
         self.assertTrue((v_norms > 0).all())
 
-        # Unrotate should accurately reconstruct input
         v_recon = turboquant_unrotate(v_rot, v_norms, seed=42)
         self.assertTrue(torch.allclose(v, v_recon, atol=1e-4))
 
@@ -85,7 +87,6 @@ class TestTurboQuantTechnique(unittest.TestCase):
         torch.manual_seed(200)
         dim = 64
         k_rot = torch.randn(2, 4, 16, dim, dtype=torch.float32)
-        # Unit spherical norm
         k_rot = k_rot / k_rot.norm(dim=-1, keepdim=True)
 
         packed, scale, _ = quantize_key_4bit(k_rot)
@@ -95,7 +96,6 @@ class TestTurboQuantTechnique(unittest.TestCase):
         k_dequant = dequantize_key_4bit(packed, scale, original_dim=dim, dtype=torch.float32)
         self.assertEqual(k_dequant.shape, k_rot.shape)
 
-        # Check cosine similarity is very high (> 0.97 for 4-bit spherical)
         cos_sim = torch.cosine_similarity(k_rot.view(-1, dim), k_dequant.view(-1, dim), dim=-1)
         self.assertGreater(cos_sim.mean().item(), 0.97)
 
@@ -116,13 +116,12 @@ class TestTurboQuantTechnique(unittest.TestCase):
         )
         self.assertEqual(v_dequant.shape, v_rot.shape)
 
-        # Cosine similarity should be high (> 0.94)
         cos_sim = torch.cosine_similarity(v_rot.view(-1, dim), v_dequant.view(-1, dim), dim=-1)
         self.assertGreater(cos_sim.mean().item(), 0.94)
 
     def test_compute_gqa_turboquant_attention(self):
         batch, seq_len, head_dim = 1, 16, 64
-        num_q_heads, num_kv_heads = 8, 2  # 4:1 GQA ratio
+        num_q_heads, num_kv_heads = 8, 2
 
         torch.manual_seed(400)
         q = torch.randn(batch, num_q_heads, seq_len, head_dim, dtype=torch.float32)
@@ -135,7 +134,63 @@ class TestTurboQuantTechnique(unittest.TestCase):
         self.assertEqual(attn_weights.shape, (batch, num_q_heads, seq_len, seq_len))
         self.assertTrue(torch.allclose(attn_weights.sum(dim=-1), torch.ones_like(attn_weights.sum(dim=-1)), atol=1e-4))
 
+    def test_turboquant_layer_lifecycle_and_compression(self):
+        torch.manual_seed(55)
+        layer = TurboQuantLayer()
+        batch, heads, seq_len, dim = 1, 8, 24, 128
+
+        k = torch.randn(batch, seq_len, heads, dim, dtype=torch.bfloat16).transpose(1, 2)
+        v = torch.randn(batch, seq_len, heads, dim, dtype=torch.bfloat16).transpose(1, 2)
+
+        out_k, out_v = layer.update(k, v)
+        self.assertEqual(out_k.shape, (batch, heads, seq_len, dim))
+        self.assertEqual(out_v.shape, (batch, heads, seq_len, dim))
+        self.assertEqual(layer.get_seq_length(), 24)
+
+        k_step = torch.randn(batch, heads, 1, dim, dtype=torch.bfloat16)
+        v_step = torch.randn(batch, heads, 1, dim, dtype=torch.bfloat16)
+        out_k2, out_v2 = layer.update(k_step, v_step)
+        self.assertEqual(out_k2.shape, (batch, heads, 25, dim))
+        self.assertEqual(layer.original_positions, list(range(25)))
+
+        bf16_bytes = 2 * batch * heads * 25 * dim * 2
+        self.assertLess(layer.quantized_bytes, bf16_bytes * 0.45)
+
+    def test_turboquant_cache_factory_and_pytorch_runner(self):
+        technique = get_technique("turboquant")
+        cache_factory = technique.pytorch_cache_factory()
+        self.assertIsNotNone(cache_factory)
+
+        cache = cache_factory()
+        self.assertIsInstance(cache, TurboQuantCache)
+        self.assertEqual(get_active_turboquant_cache(), cache)
+
+        k1 = torch.randn(1, 8, 16, 128, dtype=torch.float32)
+        v1 = torch.randn(1, 8, 16, 128, dtype=torch.float32)
+        cache.update(k1, v1, layer_idx=0)
+
+        diag = inspect_sample_diagnostic(
+            cache=cache,
+            prompt_text="Test turboquant diagnostic",
+            prompt_token_ids=list(range(16)),
+            sample_meta={"id": "tq_diag_0", "task_type": "unit"},
+            is_correct=True,
+            baseline_correct=True,
+            bits_per_scalar=4.0,
+        )
+        self.assertEqual(diag.overall_retention_ratio, 1.0)
+        self.assertEqual(diag.overall_effective_bitwidth, 4.0)
+
+        runner = PyTorchRunner(
+            model_name_or_path="Qwen/Qwen3-4B-Instruct-2507",
+            revision="cdbee75f17c01a7cc42f958dc650907174af0554",
+            cache_factory=cache_factory,
+            dry_run=True,
+        )
+        outputs = runner.generate(["Test TurboQuant prompt."], max_tokens=16)
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(len(outputs[0].outputs[0].token_ids), 16)
+
 
 if __name__ == "__main__":
     unittest.main()
-

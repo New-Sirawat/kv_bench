@@ -34,7 +34,7 @@ def fast_walsh_hadamard_transform(x: "torch.Tensor") -> "torch.Tensor":
         raise ValueError(f"Last dimension must be a power of 2, got {d}")
 
     orig_shape = x.shape
-    v = x.contiguous().view(-1, d).float()
+    v = x.contiguous().reshape(-1, d).float()
 
     h = 1
     sqrt2 = math.sqrt(2.0)
@@ -46,15 +46,17 @@ def fast_walsh_hadamard_transform(x: "torch.Tensor") -> "torch.Tensor":
         v = v.view(-1, d)
         h *= 2
 
-    return v.view(orig_shape).to(x.dtype)
+    return v.reshape(orig_shape).to(x.dtype)
 
 
 def get_random_sign_vector(dim: int, seed: int = 42, device: Any = None) -> "torch.Tensor":
     """Generate deterministic +/-1 Rademacher sign vector for Walsh-Hadamard rotation."""
     if torch is None:
         raise RuntimeError("PyTorch is required for get_random_sign_vector")
-    gen = torch.Generator().manual_seed(seed)
-    signs = torch.randint(0, 2, (dim,), generator=gen, device=device) * 2 - 1
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    signs = torch.randint(0, 2, (dim,), generator=gen, device="cpu") * 2 - 1
+    if device is not None:
+        signs = signs.to(device)
     return signs.float()
 
 
@@ -117,7 +119,6 @@ def quantize_key_4bit(
     if torch is None:
         raise RuntimeError("PyTorch is required for quantize_key_4bit")
 
-    dim = k_rot.size(-1)
     scale = k_rot.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6) / 7.0
 
     # Quantize to [-8, 7]
@@ -148,7 +149,7 @@ def dequantize_key_4bit(
     unpacked[..., 0::2] = low
     unpacked[..., 1::2] = high
 
-    return (unpacked.to(dtype) * scale).to(dtype)
+    return (unpacked.to(dtype) * scale.to(dtype)).to(dtype)
 
 
 def quantize_value_3plus1bit(
@@ -221,7 +222,7 @@ def dequantize_value_3plus1bit(
     unpacked_scalar = torch.empty(shape, dtype=torch.int8, device=packed_scalar3.device)
     unpacked_scalar[..., 0::2] = low
     unpacked_scalar[..., 1::2] = high
-    v_recon3 = unpacked_scalar.to(dtype) * scale3
+    v_recon3 = unpacked_scalar.to(dtype) * scale3.to(dtype)
 
     # 2. Unpack 1-bit QJL sketch
     sketch_bits = torch.empty(shape, dtype=torch.float32, device=packed_sketch.device)
@@ -339,8 +340,19 @@ class TurboQuantTechnique(Technique):
     def workload(self) -> Workload:
         return SyntheticFiller()
 
+    def pytorch_cache_factory(self) -> Any:
+        from src.techniques.turboquant_cache import TurboQuantCache
+
+        return lambda: TurboQuantCache()
+
     def extra_metrics(self, llm, workload_output) -> dict[str, Any]:
         del llm, workload_output
+        from src.techniques.turboquant_cache import get_active_turboquant_cache
+
+        active_cache = get_active_turboquant_cache()
+        quantized_bytes = (
+            active_cache.total_quantized_bytes if active_cache is not None else 0
+        )
         return {
             "key_bits": self.key_bits,
             "val_scalar_bits": self.val_scalar_bits,
@@ -349,5 +361,5 @@ class TurboQuantTechnique(Technique):
             "compression_ratio_vs_bf16": self.compression_ratio,
             "block_size": self.block_size,
             "asymmetric_kqv_enabled": True,
+            "quantized_cache_bytes": quantized_bytes,
         }
-
