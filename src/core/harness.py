@@ -367,8 +367,8 @@ def _run_with_profiler(llm, workload, ctx: int, max_tokens: int, profile_dir: st
 
     with profiler.profile(
         activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.CUDA],
-        record_shapes=True,
-        profile_memory=True,
+        record_shapes=False,
+        profile_memory=False,
         with_stack=False,
     ) as prof:
         workload.run(llm, ctx, max_tokens)
