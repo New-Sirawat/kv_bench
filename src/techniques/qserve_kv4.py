@@ -80,7 +80,7 @@ def compute_smooth_attention_scales(
 
     # Pool query activations across each GQA group:
     # (num_kv_heads, group_size, head_dim) -> mean over group_size -> (num_kv_heads, head_dim)
-    q_abs_max_grouped = q_abs_max.view(num_kv_heads, group_size, head_dim).mean(dim=1)
+    q_abs_max_grouped = q_abs_max.reshape(num_kv_heads, group_size, head_dim).mean(dim=1)
 
     # Calculate optimal migration scale s: (num_kv_heads, head_dim)
     scale = (k_abs_max.pow(alpha) / q_abs_max_grouped.pow(1.0 - alpha)).clamp(min=1e-3, max=1e3)
@@ -171,14 +171,14 @@ def quantize_kv_int4(
     num_groups = head_dim // group_size
 
     # Reshape into groups: (..., num_groups, group_size)
-    grouped = tensor.view(*orig_shape[:-1], num_groups, group_size)
+    grouped = tensor.contiguous().reshape(*orig_shape[:-1], num_groups, group_size)
 
     # Compute per-group symmetric absolute maximum scale: (..., num_groups, 1)
     max_val = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=eps)
     scale = (max_val / 7.0).to(tensor.dtype)
 
     # Quantize to INT4 range [-8, 7]
-    int4_val = torch.round(grouped / scale).clamp(-8, 7).view(orig_shape)
+    int4_val = torch.round(grouped / scale).clamp(-8, 7).reshape(orig_shape)
 
     # Pack into uint8 (2 values per byte)
     packed = pack_int4(int4_val)
@@ -200,8 +200,8 @@ def dequantize_kv_int4(
     num_groups = original_dim // group_size
 
     unpacked = unpack_int4(packed_tensor, original_dim).to(original_dtype)
-    grouped = unpacked.view(*unpacked.shape[:-1], num_groups, group_size)
-    dequantized = (grouped * scales).view(*unpacked.shape[:-1], original_dim)
+    grouped = unpacked.reshape(*unpacked.shape[:-1], num_groups, group_size)
+    dequantized = (grouped * scales).reshape(*unpacked.shape[:-1], original_dim)
     return dequantized.to(original_dtype)
 
 
@@ -304,12 +304,28 @@ class QServeKV4Technique(Technique):
     def workload(self) -> Workload:
         return SyntheticFiller()
 
+    def pytorch_cache_factory(self) -> Any:
+        from src.techniques.qserve_cache import QServeKVCache
+
+        return lambda: QServeKVCache(
+            group_size=self.group_size,
+            alpha=self.alpha,
+        )
+
     def extra_metrics(self, llm, workload_output) -> dict[str, Any]:
         del llm, workload_output
+        from src.techniques.qserve_cache import get_active_qserve_cache
+
+        active_cache = get_active_qserve_cache()
+        quantized_bytes = (
+            active_cache.total_quantized_bytes if active_cache is not None else 0
+        )
+
         return {
             "kv_cache_bits": 4,
             "quant_group_size": self.group_size,
             "smooth_attention_alpha": self.alpha,
             "compression_ratio_vs_bf16": self.compression_ratio,
             "block_size": self.block_size,
+            "quantized_cache_bytes": quantized_bytes,
         }
