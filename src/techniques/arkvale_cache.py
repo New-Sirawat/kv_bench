@@ -11,7 +11,6 @@ except ImportError:
     torch = None  # type: ignore[assignment]
 
 from transformers.cache_utils import Cache, DynamicLayer
-from src.techniques.arkvale import compute_page_aabb_digests
 
 _ACTIVE_ARKVALE_CACHE_REF: weakref.ReferenceType[ArkValeCache] | None = None
 
@@ -34,7 +33,7 @@ def set_active_arkvale_cache(cache: ArkValeCache | None) -> None:
 
 
 class ArkValeLayer(DynamicLayer):
-    """Cache layer implementing ArkVale page-level backup, AABB geometric digests, and page recall."""
+    """Cache layer implementing ArkVale page-level backup, cached GPU AABB digests, and page recall."""
 
     is_sliding = False
 
@@ -54,6 +53,7 @@ class ArkValeLayer(DynamicLayer):
         self.exempt_early_layers = int(exempt_early_layers)
 
         self.capacity: int = 0
+        self.page_capacity: int = 0
         self.total_tokens_seen: int = 0
         self.head_dim: int = 0
         self.target_dtype: Any = None
@@ -63,7 +63,11 @@ class ArkValeLayer(DynamicLayer):
         self.cpu_k_buf: torch.Tensor | None = None
         self.cpu_v_buf: torch.Tensor | None = None
 
-        # Active GPU subset
+        # Pre-allocated GPU AABB page digests: [B, H_kv, max_pages, D]
+        self.gpu_b_min: torch.Tensor | None = None
+        self.gpu_b_max: torch.Tensor | None = None
+
+        # Compact active sparse GPU subset during pruned decode
         self.gpu_active_k: torch.Tensor | None = None
         self.gpu_active_v: torch.Tensor | None = None
 
@@ -119,6 +123,7 @@ class ArkValeLayer(DynamicLayer):
         batch_size: int,
         num_kv: int,
         head_dim: int,
+        target_device: Any,
         target_dtype: Any,
         required_capacity: int,
     ) -> None:
@@ -126,21 +131,55 @@ class ArkValeLayer(DynamicLayer):
             return
 
         new_capacity = max(required_capacity, self.capacity * 2, 1024)
+        new_page_cap = math.ceil(new_capacity / self.page_size)
         pin = torch.cuda.is_available()
 
         new_cpu_k = torch.empty(
             (batch_size, num_kv, new_capacity, head_dim), dtype=target_dtype, device="cpu", pin_memory=pin
         )
         new_cpu_v = torch.empty_like(new_cpu_k)
+        new_b_min = torch.zeros(
+            (batch_size, num_kv, new_page_cap, head_dim), dtype=target_dtype, device=target_device
+        )
+        new_b_max = torch.zeros_like(new_b_min)
 
         if self.total_tokens_seen > 0 and self.cpu_k_buf is not None and self.cpu_v_buf is not None:
             t = self.total_tokens_seen
+            p_used = math.ceil(t / self.page_size)
             new_cpu_k[:, :, :t].copy_(self.cpu_k_buf[:, :, :t])
             new_cpu_v[:, :, :t].copy_(self.cpu_v_buf[:, :, :t])
+            if self.gpu_b_min is not None and self.gpu_b_max is not None:
+                new_b_min[:, :, :p_used].copy_(self.gpu_b_min[:, :, :p_used])
+                new_b_max[:, :, :p_used].copy_(self.gpu_b_max[:, :, :p_used])
 
         self.cpu_k_buf = new_cpu_k
         self.cpu_v_buf = new_cpu_v
+        self.gpu_b_min = new_b_min
+        self.gpu_b_max = new_b_max
         self.capacity = new_capacity
+        self.page_capacity = new_page_cap
+
+    def _update_incremental_digests(
+        self, key_states: torch.Tensor, start_pos: int, end_pos: int
+    ) -> None:
+        """Incrementally compute and cache GPU AABB page digests only for touched pages."""
+        assert self.cpu_k_buf is not None and self.gpu_b_min is not None and self.gpu_b_max is not None
+        p_start = start_pos // self.page_size
+        p_end = (end_pos - 1) // self.page_size
+
+        for p in range(p_start, p_end + 1):
+            t_s = p * self.page_size
+            t_e = min(end_pos, (p + 1) * self.page_size)
+            if t_s >= start_pos:
+                page_k = key_states[:, :, t_s - start_pos : t_e - start_pos, :]
+            else:
+                # Partial page spans across boundary: pull only the single small page from CPU
+                page_k = self.cpu_k_buf[:, :, t_s:t_e, :].to(self.target_device)
+
+            c = 0.5 * (page_k.amin(dim=-2) + page_k.amax(dim=-2))
+            r_mean = (page_k - c.unsqueeze(-2)).abs().mean(dim=-2)
+            self.gpu_b_max[:, :, p] = c + r_mean
+            self.gpu_b_min[:, :, p] = c - r_mean
 
     def update(
         self,
@@ -149,7 +188,7 @@ class ArkValeLayer(DynamicLayer):
         *args: Any,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Update ArkVale CPU backup and perform AABB digest page selection/recall on decode."""
+        """Update ArkVale CPU backup and perform cached AABB digest page selection/recall on decode."""
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
 
@@ -163,29 +202,30 @@ class ArkValeLayer(DynamicLayer):
         self.head_dim = head_dim
 
         curr = self.total_tokens_seen
-        self._ensure_capacity(batch_size, num_kv, head_dim, key_states.dtype, curr + new_tokens)
+        self._ensure_capacity(
+            batch_size, num_kv, head_dim, key_states.device, key_states.dtype, curr + new_tokens
+        )
 
         assert self.cpu_k_buf is not None and self.cpu_v_buf is not None
-        # Asynchronous proactive copy to pinned CPU host DRAM backup (zero-copy eviction)
         self.cpu_k_buf[:, :, curr : curr + new_tokens].copy_(key_states, non_blocking=True)
         self.cpu_v_buf[:, :, curr : curr + new_tokens].copy_(value_states, non_blocking=True)
         self.total_bytes_transferred_pcie += (
             (key_states.nelement() + value_states.nelement()) * key_states.element_size()
         )
 
-        self.total_tokens_seen += new_tokens
+        new_total = curr + new_tokens
+        self.total_tokens_seen = new_total
+        self._update_incremental_digests(key_states, curr, new_total)
 
-        # Early layers (layers 0..exempt-1) are exempted from page eviction
         is_exempt = self.layer_idx < self.exempt_early_layers
-        total_pages = math.ceil(self.total_tokens_seen / self.page_size)
+        total_pages = math.ceil(new_total / self.page_size)
 
         if not is_exempt and new_tokens == 1 and total_pages > self.active_pages_budget:
-            # Evaluate geometric AABB upper bounds across pages
-            k_all = self.cpu_k_buf[:, :, : self.total_tokens_seen].to(key_states.device)
-            b_min, b_max, _ = compute_page_aabb_digests(k_all, page_size=self.page_size)
+            assert self.gpu_b_min is not None and self.gpu_b_max is not None
+            b_min = self.gpu_b_min[:, :, :total_pages, :]
+            b_max = self.gpu_b_max[:, :, :total_pages, :]
 
-            # Use latest key proxy vector for geometric bound screening across pages
-            q_proxy = key_states.unsqueeze(-2)  # (B, H_kv, 1, 1, D)
+            q_proxy = key_states.unsqueeze(-2)
             prod_min = q_proxy * b_min.unsqueeze(-3)
             prod_max = q_proxy * b_max.unsqueeze(-3)
             page_scores = torch.maximum(prod_min, prod_max).sum(dim=-1).mean(dim=(0, 1, 2))
@@ -194,7 +234,6 @@ class ArkValeLayer(DynamicLayer):
             _, top_pages = torch.topk(page_scores, k=k_budget)
             selected_pages = set(top_pages.tolist()) | {0, total_pages - 1}
 
-            # Recall dormant pages that were previously evicted
             recalled = selected_pages.difference(self.resident_pages) if self.resident_pages else set()
             self.resident_pages = selected_pages
             if recalled:
@@ -207,7 +246,7 @@ class ArkValeLayer(DynamicLayer):
             fetch_indices: list[int] = []
             for p in sorted(selected_pages):
                 s = p * self.page_size
-                e = min(self.total_tokens_seen, (p + 1) * self.page_size)
+                e = min(new_total, (p + 1) * self.page_size)
                 fetch_indices.extend(range(s, e))
 
             self.active_positions = fetch_indices
@@ -216,12 +255,14 @@ class ArkValeLayer(DynamicLayer):
             self.gpu_active_v = self.cpu_v_buf[:, :, idx_cpu].to(key_states.device, non_blocking=True)
             return self.gpu_active_k, self.gpu_active_v
 
-        # Initial prefill / exempt layers / within budget
+        # Prefill or exempt layers: return reconstructed view without pinning redundant GPU copies on self
         self.resident_pages = set(range(total_pages))
-        self.active_positions = list(range(self.total_tokens_seen))
-        self.gpu_active_k = self.cpu_k_buf[:, :, : self.total_tokens_seen].to(key_states.device, non_blocking=True)
-        self.gpu_active_v = self.cpu_v_buf[:, :, : self.total_tokens_seen].to(key_states.device, non_blocking=True)
-        return self.gpu_active_k, self.gpu_active_v
+        self.active_positions = list(range(new_total))
+        self.gpu_active_k = None
+        self.gpu_active_v = None
+        k_out = self.cpu_k_buf[:, :, :new_total].to(key_states.device, non_blocking=True)
+        v_out = self.cpu_v_buf[:, :, :new_total].to(key_states.device, non_blocking=True)
+        return k_out, v_out
 
     def get_seq_length(self) -> int:
         return self.total_tokens_seen
@@ -276,7 +317,6 @@ class ArkValeCache(Cache):
     def original_positions(self) -> list[int]:
         if not self.layers:
             return []
-        # Check last layer (non-exempt when layers >= 3) for true active eviction telemetry
         return self.layers[-1].original_positions
 
     @property
