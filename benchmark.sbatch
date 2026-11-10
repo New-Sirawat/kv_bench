@@ -57,7 +57,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Default to primary pure dense model (qwen3-4b); accepts aliases (phi4-mini, qwen3.5-4b, etc.)
 MODEL="${1:-qwen3-4b}"
-TECHNIQUE="${TECHNIQUE:-infinigen}"
+TECHNIQUE="${TECHNIQUE:-flexgen_kv}"
 ENGINE="${ENGINE:-pytorch}"
 RUN_FULL_SWEEP="${RUN_FULL_SWEEP:-1}"
 SKIP_HARDWARE_SWEEPS="${SKIP_HARDWARE_SWEEPS:-0}"
