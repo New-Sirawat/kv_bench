@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import torch
 
 from src.core.axis import Axis
+from src.core.diagnostic import inspect_sample_diagnostic
+from src.core.pytorch_runner import PyTorchRunner
 from src.core.registry import get_technique, list_techniques
 from src.techniques.headq import (
     HeadQTechnique,
@@ -15,6 +17,11 @@ from src.techniques.headq import (
     dequantize_value_4bit,
     quantize_key_2bit,
     quantize_value_4bit,
+)
+from src.techniques.headq_cache import (
+    HeadQCache,
+    HeadQLayer,
+    get_active_headq_cache,
 )
 
 
@@ -47,7 +54,7 @@ class TestHeadQTechnique(unittest.TestCase):
 
     def test_invalid_parameters_rejected(self):
         with self.assertRaises(ValueError):
-            HeadQTechnique(key_bits=4)  # Must be 2-bit primary contract
+            HeadQTechnique(key_bits=4)
         with self.assertRaises(ValueError):
             HeadQTechnique(val_bits=0)
         with self.assertRaises(ValueError):
@@ -63,7 +70,6 @@ class TestHeadQTechnique(unittest.TestCase):
         basis = compute_query_pca_basis(queries, rank=rank)
 
         self.assertEqual(basis.shape, (dim, rank))
-        # Check U^T @ U == I_rank
         identity = torch.eye(rank, dtype=torch.float32)
         inner = torch.matmul(basis.transpose(0, 1), basis)
         self.assertTrue(torch.allclose(inner, identity, atol=1e-5))
@@ -75,7 +81,7 @@ class TestHeadQTechnique(unittest.TestCase):
 
         packed, scale, dequant = quantize_key_2bit(k)
         self.assertEqual(packed.dtype, torch.uint8)
-        self.assertEqual(packed.shape[-1], dim // 4)  # 4 values per byte
+        self.assertEqual(packed.shape[-1], dim // 4)
 
         unpacked = dequantize_key_2bit(packed, scale, original_dim=dim, dtype=torch.float32)
         self.assertEqual(unpacked.shape, k.shape)
@@ -113,7 +119,7 @@ class TestHeadQTechnique(unittest.TestCase):
 
     def test_gqa_headq_attention_and_kl_reduction(self):
         batch, seq_len, head_dim = 1, 32, 64
-        num_q_heads, num_kv_heads = 8, 2  # 4:1 GQA ratio
+        num_q_heads, num_kv_heads = 8, 2
 
         torch.manual_seed(400)
         q = torch.randn(batch, num_q_heads, seq_len, head_dim, dtype=torch.float32)
@@ -125,13 +131,65 @@ class TestHeadQTechnique(unittest.TestCase):
         self.assertEqual(attn_out.shape, (batch, num_q_heads, seq_len, head_dim))
         self.assertEqual(attn_weights.shape, (batch, num_q_heads, seq_len, seq_len))
         self.assertTrue(torch.allclose(attn_weights.sum(dim=-1), torch.ones_like(attn_weights.sum(dim=-1)), atol=1e-4))
-
-        # Additive logit correction should reduce attention KL divergence compared to uncorrected 2-bit
-        self.assertIn("attention_kl_corrected", metrics)
-        self.assertIn("attention_kl_coarse", metrics)
-        self.assertIn("kl_reduction_ratio", metrics)
         self.assertLess(metrics["attention_kl_corrected"], metrics["attention_kl_coarse"])
         self.assertGreater(metrics["kl_reduction_ratio"], 0.0)
+
+    def test_headq_layer_lifecycle_and_compression(self):
+        torch.manual_seed(77)
+        layer = HeadQLayer(rank=4, sidecode_bits=4)
+        batch, heads, seq_len, dim = 1, 8, 24, 128
+
+        k = torch.randn(batch, seq_len, heads, dim, dtype=torch.bfloat16).transpose(1, 2)
+        v = torch.randn(batch, seq_len, heads, dim, dtype=torch.bfloat16).transpose(1, 2)
+
+        out_k, out_v = layer.update(k, v)
+        self.assertEqual(out_k.shape, (batch, heads, seq_len, dim))
+        self.assertEqual(out_v.shape, (batch, heads, seq_len, dim))
+        self.assertEqual(layer.get_seq_length(), 24)
+
+        k_step = torch.randn(batch, heads, 1, dim, dtype=torch.bfloat16)
+        v_step = torch.randn(batch, heads, 1, dim, dtype=torch.bfloat16)
+        out_k2, _ = layer.update(k_step, v_step)
+        self.assertEqual(out_k2.shape, (batch, heads, 25, dim))
+        self.assertEqual(layer.original_positions, list(range(25)))
+
+        bf16_bytes = 2 * batch * heads * 25 * dim * 2
+        self.assertLess(layer.quantized_bytes, bf16_bytes * 0.4)
+
+    def test_headq_cache_factory_and_pytorch_runner(self):
+        technique = get_technique("headq")
+        cache_factory = technique.pytorch_cache_factory()
+        self.assertIsNotNone(cache_factory)
+
+        cache = cache_factory()
+        self.assertIsInstance(cache, HeadQCache)
+        self.assertEqual(get_active_headq_cache(), cache)
+
+        k1 = torch.randn(1, 8, 16, 128, dtype=torch.float32)
+        v1 = torch.randn(1, 8, 16, 128, dtype=torch.float32)
+        cache.update(k1, v1, layer_idx=0)
+
+        diag = inspect_sample_diagnostic(
+            cache=cache,
+            prompt_text="Test headq diagnostic",
+            prompt_token_ids=list(range(16)),
+            sample_meta={"id": "hq_diag_0", "task_type": "unit"},
+            is_correct=True,
+            baseline_correct=True,
+            bits_per_scalar=3.1,
+        )
+        self.assertEqual(diag.overall_retention_ratio, 1.0)
+        self.assertEqual(diag.overall_effective_bitwidth, 3.1)
+
+        runner = PyTorchRunner(
+            model_name_or_path="Qwen/Qwen3-4B-Instruct-2507",
+            revision="cdbee75f17c01a7cc42f958dc650907174af0554",
+            cache_factory=cache_factory,
+            dry_run=True,
+        )
+        outputs = runner.generate(["Test HeadQ prompt."], max_tokens=16)
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(len(outputs[0].outputs[0].token_ids), 16)
 
 
 if __name__ == "__main__":

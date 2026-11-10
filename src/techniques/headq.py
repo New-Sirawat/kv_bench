@@ -37,7 +37,7 @@ def compute_query_pca_basis(
     if rank > d:
         raise ValueError(f"rank ({rank}) cannot exceed head dimension ({d})")
 
-    q_flat = queries.contiguous().view(-1, d).float()
+    q_flat = queries.contiguous().reshape(-1, d).float()
     # Center queries along each feature dimension
     q_centered = q_flat - q_flat.mean(dim=0, keepdim=True)
 
@@ -75,7 +75,7 @@ def quantize_key_2bit(
 
     # Quantize to integer levels [-2, 1]
     q = torch.round(k / scale).clamp(-2, 1).to(torch.int8)
-    dequant = q.to(k.dtype) * scale
+    dequant = q.to(k.dtype) * scale.to(k.dtype)
 
     # Map [-2, 1] -> [0, 3] for uint8 packing
     u2 = (q + 2).to(torch.uint8)
@@ -114,7 +114,7 @@ def dequantize_key_2bit(
     unpacked[..., 2::4] = b2
     unpacked[..., 3::4] = b3
 
-    return (unpacked.to(dtype) * scale).to(dtype)
+    return (unpacked.to(dtype) * scale.to(dtype)).to(dtype)
 
 
 def compute_key_sidecode(
@@ -137,12 +137,11 @@ def compute_key_sidecode(
 
     # Project residual: z = e @ basis, shape (..., r)
     z_proj = torch.matmul(k_residual.float(), basis.float()).to(k_residual.dtype)
-    r = z_proj.size(-1)
 
     # 4-bit uniform quantization in [-8, 7]
     scale = z_proj.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6) / 7.0
     q = torch.round(z_proj / scale).clamp(-8, 7).to(torch.int8)
-    z_dequant = q.to(k_residual.dtype) * scale
+    z_dequant = q.to(k_residual.dtype) * scale.to(k_residual.dtype)
 
     # Pack 2 4-bit nibbles into uint8 byte
     u4 = (q + 8).to(torch.uint8)
@@ -170,7 +169,7 @@ def dequantize_key_sidecode(
     unpacked[..., 0::2] = low
     unpacked[..., 1::2] = high
 
-    return (unpacked.to(dtype) * scale).to(dtype)
+    return (unpacked.to(dtype) * scale.to(dtype)).to(dtype)
 
 
 def quantize_value_4bit(
@@ -180,10 +179,9 @@ def quantize_value_4bit(
     if torch is None:
         raise RuntimeError("PyTorch is required for quantize_value_4bit")
 
-    dim = v.size(-1)
     scale = v.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6) / 7.0
     q = torch.round(v / scale).clamp(-8, 7).to(torch.int8)
-    dequant = q.to(v.dtype) * scale
+    dequant = q.to(v.dtype) * scale.to(v.dtype)
 
     u4 = (q + 8).to(torch.uint8)
     packed = u4[..., 0::2] | (u4[..., 1::2] << 4)
@@ -209,7 +207,7 @@ def dequantize_value_4bit(
     unpacked[..., 0::2] = low
     unpacked[..., 1::2] = high
 
-    return (unpacked.to(dtype) * scale).to(dtype)
+    return (unpacked.to(dtype) * scale.to(dtype)).to(dtype)
 
 
 def compute_gqa_headq_attention(
@@ -259,13 +257,11 @@ def compute_gqa_headq_attention(
         expanded_z = z_dequant.repeat_interleave(gqa_ratio, dim=1)
         expanded_v = v_dequant.repeat_interleave(gqa_ratio, dim=1)
         expanded_k_exact = key.repeat_interleave(gqa_ratio, dim=1)
-        expanded_v_exact = value.repeat_interleave(gqa_ratio, dim=1)
     else:
         expanded_k_base = k_dequant
         expanded_z = z_dequant
         expanded_v = v_dequant
         expanded_k_exact = key
-        expanded_v_exact = value
 
     softmax_scale = scale if scale is not None else (d ** -0.5)
 
@@ -273,7 +269,7 @@ def compute_gqa_headq_attention(
     coarse_logits = torch.matmul(query.float(), expanded_k_base.float().transpose(-2, -1)) * softmax_scale
 
     # Additive logit correction via query PCA projection
-    q_proj = torch.matmul(query.float(), basis.float()).to(query.dtype)  # (batch, num_q_heads, seq_len_q, r)
+    q_proj = torch.matmul(query.float(), basis.float()).to(query.dtype)
     delta_s = torch.matmul(q_proj.float(), expanded_z.float().transpose(-2, -1)) * softmax_scale
 
     # Corrected logits
@@ -285,15 +281,12 @@ def compute_gqa_headq_attention(
     exact_logits = torch.matmul(query.float(), expanded_k_exact.float().transpose(-2, -1)) * softmax_scale
     exact_weights = F.softmax(exact_logits, dim=-1).to(query.dtype)
 
-    # Model-visible distortion metrics
-    # 1. Attention KL divergence
     kl_div = F.kl_div(
         F.log_softmax(corrected_logits, dim=-1),
         exact_weights,
         reduction="batchmean",
     ).item()
 
-    # 2. Uncorrected coarse KL divergence for comparison
     kl_coarse = F.kl_div(
         F.log_softmax(coarse_logits, dim=-1),
         exact_weights,
@@ -377,8 +370,22 @@ class HeadQTechnique(Technique):
     def workload(self) -> Workload:
         return SyntheticFiller()
 
+    def pytorch_cache_factory(self) -> Any:
+        from src.techniques.headq_cache import HeadQCache
+
+        return lambda: HeadQCache(
+            rank=self.rank,
+            sidecode_bits=self.sidecode_bits,
+        )
+
     def extra_metrics(self, llm, workload_output) -> dict[str, Any]:
         del llm, workload_output
+        from src.techniques.headq_cache import get_active_headq_cache
+
+        active_cache = get_active_headq_cache()
+        quantized_bytes = (
+            active_cache.total_quantized_bytes if active_cache is not None else 0
+        )
         effective_key_bits = self.key_bits + (self.rank * self.sidecode_bits) / 128.0
         return {
             "key_bits": self.key_bits,
@@ -389,4 +396,5 @@ class HeadQTechnique(Technique):
             "compression_ratio_vs_bf16": self.compression_ratio,
             "block_size": self.block_size,
             "model_visible_distortion_aware": True,
+            "quantized_cache_bytes": quantized_bytes,
         }
