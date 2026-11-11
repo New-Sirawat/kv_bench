@@ -1,0 +1,55 @@
+{
+  "manifest_version": "1.0",
+  "generated_at": "2026-11-11T04:06:57Z",
+  "provenance_type": "technique_run_manifest",
+  "milestone": "WP-3",
+  "work_package": "WP3-10",
+  "technique": "arkvale",
+  "engine": "pytorch",
+  "axes": [
+    "STRUCTURAL",
+    "SPATIAL"
+  ],
+  "technique_config": {
+    "cache_class": "ArkValeCache",
+    "page_size": 16,
+    "active_pages_budget": 16,
+    "exempt_early_layers": 2,
+    "block_size": 16
+  },
+  "primary_model": {
+    "name": "Qwen/Qwen3-4B-Instruct-2507",
+    "revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+    "architecture": "Pure Dense GQA",
+    "dtype": "bfloat16"
+  },
+  "execution_environment": {
+    "cluster_node": "gpu06.slurm.cpe.kmutt.ac.th",
+    "slurm_job_id": "25751",
+    "gpu_model": "NVIDIA GeForce RTX 4090",
+    "physical_vram_gib": 23.52,
+    "process_allocator_cap_gib": 16.0
+  },
+  "golden_artifacts": {
+    "arkvale_hardware_pytorch_16gb": {
+      "path": "results/runs/wp3/arkvale_hardware_pytorch_16gb.json",
+      "sha256": "ae157a8de1316b1e43e528a57641aceca9229b8160f49b57867d02a2d9abc998",
+      "size_bytes": 9685
+    },
+    "arkvale_longmem_pytorch_16gb": {
+      "path": "results/runs/wp3/arkvale_longmem_pytorch_16gb.json",
+      "sha256": "02a7099661776945160399b2dc3b3d15d4974d5f9349cba489bcdeb185994309",
+      "size_bytes": 35967
+    },
+    "arkvale_niah_pytorch_16gb": {
+      "path": "results/runs/wp3/arkvale_niah_pytorch_16gb.json",
+      "sha256": "905adc25159020d8d374dab4964ece48acdb85937bf9dc1525730cce4d64c758",
+      "size_bytes": 7084
+    },
+    "verify_arkvale_pytorch_16gb": {
+      "path": "results/runs/wp3/verify_arkvale_pytorch_16gb.json",
+      "sha256": "ac714f273bbb18345deed4e521a565103270361278d98eae960c08a088484191",
+      "size_bytes": 1339
+    }
+  }
+}
