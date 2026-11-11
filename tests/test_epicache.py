@@ -158,6 +158,49 @@ class TestEpiCacheTechnique(unittest.TestCase):
         self.assertEqual(len(outputs), 1)
         self.assertEqual(len(outputs[0].outputs[0].token_ids), 16)
 
+    def test_epicache_chunked_prefill_causal_mask_alignment(self):
+        from transformers import Qwen3Config, Qwen3ForCausalLM
+
+        cfg = Qwen3Config(
+            vocab_size=256,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+        )
+        for dtype in (torch.float32, torch.bfloat16):
+            model = Qwen3ForCausalLM(cfg).to(dtype=dtype).eval()
+            cache = EpiCacheCache(
+                total_layers=6, episode_budget_tokens=128, layer_sensitivity_alpha=2.0
+            )
+            with torch.no_grad():
+                model(
+                    input_ids=torch.randint(0, 256, (1, 128)),
+                    position_ids=torch.arange(0, 128).unsqueeze(0),
+                    past_key_values=cache,
+                    use_cache=True,
+                )
+                cache.prune_after_chunk()
+                out2 = model(
+                    input_ids=torch.randint(0, 256, (1, 96)),
+                    position_ids=torch.arange(128, 224).unsqueeze(0),
+                    past_key_values=cache,
+                    use_cache=True,
+                )
+                cache.prune_after_chunk()
+                next_tok = out2.logits[:, -1:, :].argmax(dim=-1)
+                out3 = model(
+                    input_ids=next_tok,
+                    position_ids=torch.tensor([[224]]),
+                    past_key_values=cache,
+                    use_cache=True,
+                )
+            self.assertEqual(cache.get_seq_length(0), 128)
+            self.assertEqual(len(cache.original_positions), 128)
+            self.assertEqual(out3.logits.shape, (1, 1, 256))
+
 
 if __name__ == "__main__":
     unittest.main()

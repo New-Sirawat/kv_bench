@@ -58,10 +58,12 @@ class EpiCacheLayer(DynamicLayer):
             base_budget_per_layer=self.episode_budget_tokens,
             alpha=self.layer_sensitivity_alpha,
         )
-        # Ensure minimum safe budget works with small synthetic budgets too
-        self.layer_budget: int = budgets.get(self.layer_idx, self.episode_budget_tokens)
-        if self.episode_budget_tokens < 64:
-            self.layer_budget = self.episode_budget_tokens
+        self.sensitivity_budget: int = budgets.get(self.layer_idx, self.episode_budget_tokens)
+        # HuggingFace causal models construct a single shared 4D causal_mask using layer 0's
+        # past sequence length for all full-attention layers. Keep retained KV sequence lengths
+        # aligned across layers at the exact average budget (total_layers * episode_budget_tokens)
+        # so multi-chunk prefill (q_len > 1) never hits cross-layer mask dimension mismatches.
+        self.layer_budget: int = self.episode_budget_tokens
 
         self.original_positions: list[int] = []
         self.total_tokens_seen: int = 0
@@ -73,7 +75,7 @@ class EpiCacheLayer(DynamicLayer):
         *args: Any,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Append incoming states and evict excess tokens on decode if exceeding layer sensitivity budget."""
+        """Append incoming states and evict excess tokens on decode if exceeding layer budget."""
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
 
@@ -92,7 +94,7 @@ class EpiCacheLayer(DynamicLayer):
         return self.keys, self.values
 
     def prune(self) -> None:
-        """Prune retained block buffer to sensitivity budget, preserving token 0 sink & salient keys."""
+        """Prune retained block buffer to budget, preserving token 0 sink & salient keys."""
         if self.is_initialized and self.keys is not None and self.values is not None:
             seq_len = self.keys.shape[-2]
             if seq_len > self.layer_budget:
